@@ -1,0 +1,38 @@
+{
+  "ensemble": {
+    "mae": 239.32530044879735,
+    "rmse": 1089.7114376314805
+  },
+  "quantile": {
+    "mae": 242.00459640714863,
+    "rmse": 1103.506389343934
+  },
+  "feature_importances": {
+    "char_count": 0.1318354055669763,
+    "word_count": 0.0999033616971552,
+    "question_count": 0.009926657391596426,
+    "exclamation_count": 0.03538763835027811,
+    "mention_count": 0.06364489265681685,
+    "day_of_week": 0.06790355248682771,
+    "is_weekend": 0.02906078847753991,
+    "text_length": 0.12898150334031633,
+    "has_media": 0.0,
+    "hour": 0.1501706430585378,
+    "has_url": 0.0,
+    "has_news_url": 0.0,
+    "trending_hashtag_count": 0.0,
+    "topic_category": 0.0,
+    "question_word_count": 0.009332169070104729,
+    "cta_word_count": 0.0,
+    "sentiment_compound": 0.2738533879038506,
+    "emotion_anger": 0.0,
+    "emotion_fear": 0.0,
+    "emotion_joy": 0.0,
+    "emotion_sadness": 0.0,
+    "emotion_surprise": 0.0
+  },
+  "models_trained": {
+    "ensemble_models": 5,
+    "quantile_model": true
+  }
+}

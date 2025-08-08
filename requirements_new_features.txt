@@ -1,0 +1,7 @@
+# Requirements for new topic and trending features
+transformers>=4.21.0
+torch>=1.12.0
+scipy>=1.9.0
+
+# Optional for trending data (if you want to use pytrends)
+# pytrends>=4.9.0
