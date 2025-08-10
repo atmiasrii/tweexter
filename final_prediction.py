@@ -17,9 +17,30 @@ from pathlib import Path
 from features import extract_features_from_text, MODEL_FEATURES
 from persona_engine import load_personas, aggregate_engagement
 
-# Import new modules for topic and trending features
-from topic_category_hf import get_topic_category
-from trending_hashtags import count_trending_hashtags
+# Import new modules for topic and trending features (robust fallbacks)
+try:
+    from topic_category_hf import get_topic_category
+except Exception:
+    def get_topic_category(_):  # fallback to "general"/0
+        return 0
+
+try:
+    from trending_hashtags import count_trending_hashtags
+    TRENDING_OK = True
+except Exception:
+    TRENDING_OK = False
+    def count_trending_hashtags(_):
+        return 0
+
+import re
+NEWS_DOMAINS = ('bbc.', 'cnn.', 'nytimes.', 'reuters.', 'techcrunch.', 'washingtonpost.', 'theguardian.')
+def _has_url(t: str) -> int:
+    return 1 if re.search(r'https?://', t or '') else 0
+def _has_news_url(t: str) -> int:
+    if not t:
+        return 0
+    urls = re.findall(r'https?://[^\s]+', t)
+    return 1 if any(any(nd in u for nd in NEWS_DOMAINS) for u in urls) else 0
 
 # -----------------------------
 # Default global blend weights
@@ -31,6 +52,12 @@ DEFAULT_GLOBAL_WEIGHTS = {
 }
 
 BLEND_WEIGHTS_PATH = Path("blend_weights.json")
+
+def _first_existing(*paths):
+    for p in paths:
+        if Path(p).exists():
+            return p
+    return None
 
 def load_blend_weights():
     """Load optional overrides from blend_weights.json; fall back to defaults."""
@@ -51,6 +78,24 @@ def load_blend_weights():
 # Model loading
 # -----------------------------
 print("Loading NEW retweet and reply models (if present)...")
+# --- NEW: Likes ensemble/quantile (prefer *_final if present) ---
+new_likes_ensemble = []
+for seed in [42, 99, 123, 456, 789]:
+    fn = _first_existing(f"NEW_likes_model_seed_{seed}_final.pkl",
+                         f"NEW_likes_model_seed_{seed}.pkl")
+    if fn:
+        m = joblib.load(fn)
+        new_likes_ensemble.append(m)
+        if len(new_likes_ensemble) == 1 and hasattr(m, "feature_names_in_"):
+            print(f"✅ NEW Likes Model Features: {list(m.feature_names_in_)}")
+    else:
+        print(f"⚠️ NEW_likes model for seed {seed} not found")
+
+qpath = _first_existing("NEW_likes_quantile_model_final.pkl",
+                        "NEW_likes_quantile_model.pkl")
+new_likes_quantile = joblib.load(qpath) if qpath else None
+if new_likes_quantile is None:
+    print("⚠️ NEW_likes_quantile_model not found")
 
 # NEW Retweet ensemble/quantile
 new_rt_ensemble = []
@@ -134,65 +179,57 @@ def get_new_model_features():
 
 def prepare_features_for_new_models(tweet_text: str) -> dict:
     """Build a dict with every feature NEW models might ask for."""
-    feats = extract_features_from_text(tweet_text)  # your base extractor
-    text_lower = tweet_text.lower()
-
-    # Populate missing NEW features
-    feats.setdefault("text_length", len(tweet_text))
-    feats.setdefault("has_media", 0)  # update upstream if media is known
-    feats.setdefault("hour", 12)      # can be overridden by caller if desired
-    feats.setdefault("has_url", 1 if ("http://" in text_lower or "https://" in text_lower) else 0)
-    feats.setdefault("has_news_url", 0)
-    
-    # Use new trending hashtag module
-    feats.setdefault("trending_hashtag_count", count_trending_hashtags(tweet_text))
-
-    # Use new topic category module
+    feats = extract_features_from_text(tweet_text)
+    text_lower = (tweet_text or "").lower()
+    # Core NEW features
+    feats.setdefault("text_length", len(tweet_text or ""))
+    feats.setdefault("has_media", 0)   # unknown at inference => 0
+    feats.setdefault("hour", 12)       # override from caller if you know it
+    feats["has_url"] = _has_url(tweet_text)
+    feats["has_news_url"] = _has_news_url(tweet_text)
+    # Trending hashtags count (safe fallback if module missing)
+    feats["trending_hashtag_count"] = count_trending_hashtags(tweet_text) if TRENDING_OK else 0
+    # Topic id/category (fallback defined in import)
     feats["topic_category"] = get_topic_category(tweet_text)
-
     # Reply cues
-    feats.setdefault("question_word_count", sum(1 for w in ["what","how","why","when","where","who","which"] if w in text_lower))
-    feats.setdefault("cta_word_count", sum(1 for w in ["please","help","share","comment","reply","thoughts"] if w in text_lower))
-
+    feats.setdefault("question_word_count",
+        sum(1 for w in ["what","how","why","when","where","who","which"] if w in text_lower))
+    feats.setdefault("cta_word_count",
+        sum(1 for w in ["please","help","share","comment","reply","thoughts","rt"] if w in text_lower))
     # Sentiment/emotions fallbacks
     feats.setdefault("sentiment_compound", 0.0)
     feats.setdefault("sentiment_subjectivity", 0.5)
     for emo in ["anger","fear","joy","sadness","surprise"]:
         feats.setdefault(f"emotion_{emo}", 0.0)
-
     return feats
 
 def predict_metric_ml_old(models, scaler, features_df):
-    """Old models: average ensemble, unscale from log space."""
+    """Old models: average ensemble, unscale from log space.
+    Returns float (keep precision; no rounding/casting)."""
     if not models:
-        return 0
-    preds = [m.predict(features_df)[0] for m in models]
+        return 0.0
+    preds = [float(m.predict(features_df)[0]) for m in models]
     base = float(np.mean(preds))
     pred_log = base * scaler.get("std", 1.0) + scaler.get("mean", 0.0)
-    return int(safe_expm1(pred_log))
+    return float(max(0.0, safe_expm1(pred_log)))
+
 
 def _predict_new_core(model_or_list, features_dict):
-    """Helper: run NEW model(s) in log space and return int on original scale."""
+    """Run NEW model(s) in log space and return float on original scale (no rounding)."""
     if isinstance(model_or_list, list) and model_or_list:
         m0 = model_or_list[0]
         feature_names = getattr(m0, "feature_names_in_", None)
-        if feature_names is not None:
-            names = list(feature_names)
-        else:
-            names = get_new_model_features()
+        names = list(feature_names) if feature_names is not None else get_new_model_features()
         X = pd.DataFrame([[features_dict.get(f, 0) for f in names]], columns=names)
-        log_pred = float(np.mean([m.predict(X)[0] for m in model_or_list]))
+        log_pred = float(np.mean([float(m.predict(X)[0]) for m in model_or_list]))
     elif model_or_list is not None:
         feature_names = getattr(model_or_list, "feature_names_in_", None)
-        if feature_names is not None:
-            names = list(feature_names)
-        else:
-            names = get_new_model_features()
+        names = list(feature_names) if feature_names is not None else get_new_model_features()
         X = pd.DataFrame([[features_dict.get(f, 0) for f in names]], columns=names)
         log_pred = float(model_or_list.predict(X)[0])
     else:
-        return 0
-    return int(min(safe_expm1(log_pred), 100000))
+        return 0.0
+    return float(min(safe_expm1(log_pred), 100000.0))
 
 # -----------------------------
 # Main blend function
@@ -235,33 +272,40 @@ def predict_blended(tweet_text: str, blend_weights: dict | None = None):
         print("⚠️ Using OLD Reply Models")
         ml_replies = predict_metric_ml_old(reg_models_reply, reply_scaler, features_df)
 
-    # Likes (still OLD)
-    print("⚠️ Using OLD Likes Models")
-    ml_likes = predict_metric_ml_old(reg_models_likes, likes_scaler, features_df)
+    # Likes
+    if new_likes_ensemble:
+        print("🚀 Using NEW Likes Ensemble Models")
+        ml_likes = _predict_new_core(new_likes_ensemble, enhanced)
+    elif new_likes_quantile:
+        print("🚀 Using NEW Likes Quantile Model")
+        ml_likes = _predict_new_core(new_likes_quantile, enhanced)
+    else:
+        print("⚠️ Using OLD Likes Models")
+        ml_likes = predict_metric_ml_old(reg_models_likes, likes_scaler, features_df)
 
-    # --- Persona predictions ---
+    # Persona (as float)
     persona = aggregate_engagement(tweet_text, PERSONAS)
-    persona_likes = int(persona.get("persona_likes", 0))
-    persona_retweets = int(persona.get("persona_rts", 0))
-    persona_replies = int(persona.get("persona_replies", 0))
+    persona_likes = float(persona.get("persona_likes", 0.0))
+    persona_retweets = float(persona.get("persona_rts", 0.0))
+    persona_replies = float(persona.get("persona_replies", 0.0))
 
-    # --- Global blending (no leakage) ---
-    w_likes = float(weights.get("likes", DEFAULT_GLOBAL_WEIGHTS["likes"]))
-    w_rts = float(weights.get("retweets", DEFAULT_GLOBAL_WEIGHTS["retweets"]))
-    w_replies = float(weights.get("replies", DEFAULT_GLOBAL_WEIGHTS["replies"]))
+    # Global blending
+    w_likes   = float(weights.get("likes",    DEFAULT_GLOBAL_WEIGHTS["likes"]))
+    w_rts     = float(weights.get("retweets", DEFAULT_GLOBAL_WEIGHTS["retweets"]))
+    w_replies = float(weights.get("replies",  DEFAULT_GLOBAL_WEIGHTS["replies"]))
 
-    blended_likes = int(round(ml_likes * w_likes + persona_likes * (1.0 - w_likes)))
-    blended_retweets = int(round(ml_retweets * w_rts + persona_retweets * (1.0 - w_rts)))
-    blended_replies = int(round(ml_replies * w_replies + persona_replies * (1.0 - w_replies)))
+    blended_likes    = (ml_likes    * w_likes)   + (persona_likes    * (1.0 - w_likes))
+    blended_retweets = (ml_retweets * w_rts)     + (persona_retweets * (1.0 - w_rts))
+    blended_replies  = (ml_replies  * w_replies) + (persona_replies  * (1.0 - w_replies))
 
     return {
         "weights_used": {"likes": w_likes, "retweets": w_rts, "replies": w_replies},
         "models_used": {
-            "likes": "OLD",
-            "retweets": "NEW" if (new_rt_ensemble or new_rt_quantile) else "OLD",
-            "replies": "NEW" if (new_reply_ensemble or new_reply_quantile) else "OLD",
+            "likes":    "NEW" if (new_likes_ensemble or new_likes_quantile) else "OLD",
+            "retweets": "NEW" if (new_rt_ensemble    or new_rt_quantile)    else "OLD",
+            "replies":  "NEW" if (new_reply_ensemble or new_reply_quantile) else "OLD",
         },
-        "ml": {"likes": ml_likes, "retweets": ml_retweets, "replies": ml_replies},
+        "ml":      {"likes": ml_likes, "retweets": ml_retweets, "replies": ml_replies},
         "persona": {"likes": persona_likes, "retweets": persona_retweets, "replies": persona_replies},
         "blended": {"likes": blended_likes, "retweets": blended_retweets, "replies": blended_replies},
     }
@@ -288,12 +332,12 @@ if __name__ == "__main__":
 
     print("\n=== ML PREDICTIONS ===")
     for k, v in result["ml"].items():
-        print(f"{k.capitalize():8s}: {v}")
+        print(f"{k.capitalize():8s}: {int(round(v))}")
 
     print("\n=== PERSONA ENGINE PREDICTIONS ===")
     for k, v in result["persona"].items():
-        print(f"{k.capitalize():8s}: {v}")
+        print(f"{k.capitalize():8s}: {int(round(v))}")
 
     print("\n=== BLENDED PREDICTIONS ===")
     for k, v in result["blended"].items():
-        print(f"{k.capitalize():8s}: {v}")
+        print(f"{k.capitalize():8s}: {int(round(v))}")

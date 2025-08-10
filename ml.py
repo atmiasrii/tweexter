@@ -9,6 +9,11 @@ from sklearn.metrics import mean_absolute_error, classification_report, recall_s
 from sklearn.utils import class_weight
 from sklearn.calibration import CalibratedClassifierCV
 import os
+# === NEW: imports for feature parity with NEW heads ===
+from topic_category_hf import get_topic_category      # same module used at inference
+from trending_hashtags import count_trending_hashtags # same module used at inference
+import re
+from sklearn.preprocessing import OneHotEncoder
 
 # --- Specialized Engagement Models ---
 from retweet_model import RetweetPredictor
@@ -190,14 +195,91 @@ df['viral_potential'] = np.where(
     1, 0
 )
 
+# === NEW: Build features to match NEW heads for LIKES training ===
+# We'll create the same columns inference expects; if 'text' is missing, we use safe defaults.
+HAS_TEXT = 'text' in df.columns
+
+def has_url_fn(t):
+    return 1 if re.search(r'https?://', t or '') else 0
+
+NEWS_DOMAINS = ('bbc.', 'cnn.', 'nytimes.', 'reuters.', 'techcrunch.', 'washingtonpost.', 'theguardian.')
+
+def has_news_url_fn(t):
+    if not t:
+        return 0
+    urls = re.findall(r'https?://[^\s]+', t)
+    return 1 if any(any(nd in u for nd in NEWS_DOMAINS) for u in urls) else 0
+
+QUESTION_WORDS = ('what','how','why','when','where','who','which')
+CTA_WORDS = ('please','help','share','comment','reply','thoughts','rt')
+
+# 1) Core NEW columns (exact names used at inference)
+df['text_length'] = df['char_count'] if not HAS_TEXT else df['text'].astype(str).str.len()
+df['has_media'] = 0  # no media info in dataset; keep 0 so train==infer
+df['has_url'] = 0 if not HAS_TEXT else df['text'].astype(str).apply(has_url_fn)
+df['has_news_url'] = 0 if not HAS_TEXT else df['text'].astype(str).apply(has_news_url_fn)
+
+# trending_hashtag_count: consistent with inference (safe fallback 0 if no text)
+if HAS_TEXT:
+    df['trending_hashtag_count'] = df['text'].astype(str).apply(count_trending_hashtags)
+else:
+    df['trending_hashtag_count'] = 0
+
+# topic_category: store as an integer ID (inference should return the same ID; if not, fallback to 0)
+if HAS_TEXT:
+    df['topic_category'] = df['text'].astype(str).apply(get_topic_category)
+else:
+    df['topic_category'] = 0  # 'general' bucket
+
+# 2) Sentiment subjectivity + basic emotions (keep consistent with inference defaults)
+if 'sentiment_subjectivity' not in df.columns:
+    df['sentiment_subjectivity'] = 0.5
+for emo in ['anger','fear','joy','sadness','surprise']:
+    col = f'emotion_{emo}'
+    if col not in df.columns:
+        df[col] = 0.0  # keep zeros; same as inference fallback
+
+# 3) Reply cues that also help likes on Q&A/CTA posts
+if HAS_TEXT:
+    low_text = df['text'].astype(str).str.lower()
+    df['question_word_count'] = low_text.apply(lambda t: sum(1 for w in QUESTION_WORDS if w in t))
+    df['cta_word_count'] = low_text.apply(lambda t: sum(1 for w in CTA_WORDS if w in t))
+else:
+    df['question_word_count'] = 0
+    df['cta_word_count'] = 0
+
+# 4) Ensure every NEW feature column exists with a numeric dtype
+NEW_LIKES_FEATURES = [
+    "char_count","word_count","sentence_count","hashtag_count","mention_count",
+    "question_count","exclamation_count","day_of_week","is_weekend",
+    "text_length","has_media","hour","has_url","has_news_url","trending_hashtag_count",
+    "topic_category",
+    "sentiment_compound","sentiment_subjectivity",
+    "emotion_anger","emotion_fear","emotion_joy","emotion_sadness","emotion_surprise",
+    "question_word_count","cta_word_count"
+]
+for c in NEW_LIKES_FEATURES:
+    if c not in df.columns:
+        df[c] = 0
+
+# If sentence_count is missing, set to 1 (avoid zero division in other logic)
+if 'sentence_count' in df.columns:
+    df['sentence_count'] = df['sentence_count'].replace(0, 1)
+else:
+    df['sentence_count'] = 1
+
+# Persist the final column order used by NEW likes models (for inference)
+joblib.dump(NEW_LIKES_FEATURES, 'NEW_likes_feature_names.pkl')
+print(f"✅ NEW likes feature list saved with {len(NEW_LIKES_FEATURES)} columns")
+# Why: Your NEW heads in final_prediction.py expect exactly these columns. This makes likes use the same signals and scale properly.
+
 # --- URGENT FIX: Isolate and Handle Viral Outliers ---
 print("Identifying and handling viral outliers...")
 VIRAL_LIKE_THRESHOLD = 50000  # Reduced threshold for better viral model training
-viral_mask = (df['likes'] > VIRAL_LIKE_THRESHOLD)
-print(f"Found {viral_mask.sum()} extreme viral tweets (>{VIRAL_LIKE_THRESHOLD:,} likes)")
+# NOTE: don't compute viral_mask yet; rows are about to be removed
 
-# Create special viral features
-df['is_extreme_viral'] = viral_mask.astype(int)
+# Create special viral features (use likes directly for now)
+df['is_extreme_viral'] = (df['likes'] > VIRAL_LIKE_THRESHOLD).astype(int)
 df['viral_interaction'] = df['char_count'] * df['is_extreme_viral']
 df['viral_sentiment'] = df['sentiment_compound'] * df['is_extreme_viral']
 df['viral_length'] = df['char_count'] * df['is_extreme_viral']
@@ -212,6 +294,9 @@ df['likes_winsor'] = np.clip(df['likes'], lower, upper)
 # Use winsorized likes for better target
 log_likes = np.log1p(df['likes_winsor'])
 df['capped_log_likes'] = log_likes  # Already winsorized
+# === NEW: Target for NEW likes models (pure log-likes, no z-score) ===
+y_likes_log = df['capped_log_likes']  # ln(1 + winsorized likes)
+
 df['norm_likes'] = (df['capped_log_likes'] - df['capped_log_likes'].mean()) / df['capped_log_likes'].std()
 df['norm_likes'] = np.clip(df['norm_likes'], -3, 3)
 
@@ -233,8 +318,9 @@ df = df.dropna(subset=available_core_features)
 
 print(f"After data cleaning: {len(df)} rows remaining")
 
-# Create separate dataset for virals AFTER target engineering
-viral_df = df[viral_mask].copy() if viral_mask.sum() > 0 else None
+# Recompute AFTER cleaning to avoid index misalignment
+viral_mask = df['likes'] > VIRAL_LIKE_THRESHOLD
+viral_df = df.loc[viral_mask].copy() if viral_mask.any() else None
 print(f"Viral dataset size: {len(viral_df) if viral_df is not None else 0} samples")
 
 le = LabelEncoder()
@@ -282,9 +368,24 @@ y_clf = df['virality_numeric']
 y_binary = df['is_viral']  # Binary viral classification
 
 # Initial train/test split for final evaluation
+# FIX: add '=' after stratify and stratify by the binary viral label
 X_train, X_test, y_reg_train, y_reg_test, y_clf_train, y_clf_test, y_binary_train, y_binary_test = train_test_split(
-    X, y_reg, y_clf, y_binary, test_size=0.2, random_state=42, stratify df['is_viral']
+    X, y_reg, y_clf, y_binary, test_size=0.2, random_state=42, stratify=df['is_viral']
 )
+# === NEW: Split data specifically for NEW likes features ===
+X_likes = df.loc[:, NEW_LIKES_FEATURES]
+X_likes_train = X_likes.loc[X_train.index]
+X_likes_test  = X_likes.loc[X_test.index]
+y_likes_log_train = y_likes_log.loc[X_train.index]
+y_likes_log_test  = y_likes_log.loc[X_test.index]
+
+# Safety: replace remaining NaNs with 0 for training matrices
+X_train = X_train.fillna(0)
+X_test  = X_test.fillna(0)
+X_likes_train = X_likes_train.fillna(0)
+X_likes_test  = X_likes_test.fillna(0)
+
+print(f"NEW likes feature matrix shapes -> train: {X_likes_train.shape}, test: {X_likes_test.shape}")
 
 # --- Robust Cross-Validation ---
 print("\nPerforming robust K-fold cross-validation...")
@@ -444,194 +545,170 @@ for i, model in enumerate(reg_models):
     joblib.dump(model, f'regression_xgb_seed_{reg_seeds[i]}.pkl')
 print(f"✅ Trained {len(reg_models)} regression models")
 
-# --- NEW: Quantile Regression for Median Prediction ---
-print("\nTraining quantile regression models for MEDIAN prediction...")
-print("Note: Quantile regression predicts the median (50th percentile) instead of mean")
-
-# Check XGBoost version and use appropriate objective
-import xgboost as xgb
-xgb_version = xgb.__version__
-print(f"XGBoost version: {xgb_version}")
-
-try:
-    # Try modern quantile regression (XGBoost >= 1.7)
-    quantile_objective = 'reg:quantileerror'
-    print("Using modern quantile regression objective")
-    
-    # Train quantile regression model for LIKES (median)
-    print("  Training LIKES quantile regression model (median)...")
-    quantile_model_likes = XGBRegressor(
-        objective=quantile_objective,
-        quantile_alpha=0.5,  # For median (50th percentile)
-        max_depth=4,
-        min_child_weight=5,
-        n_estimators=400,
-        reg_alpha=1.0,
-        reg_lambda=1.0,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42,
-        n_jobs=-1,
-        early_stopping_rounds=20
-    )
-    quantile_model_likes.fit(X_train, y_reg_train,
-                           eval_set=[(X_test, y_reg_test)],
-                           verbose=False)
-    joblib.dump(quantile_model_likes, 'regression_quantile_likes_median.pkl')
-    print("✅ Trained LIKES quantile regression model (median)")
-    
-except Exception as e:
-    print(f"⚠️ Modern quantile regression failed: {e}")
-    print("Using ensemble median as fallback...")
-    # Fallback: Use ensemble and take median at prediction time
-    quantile_model_likes = None
-
-# Alternative approach: Train multiple models and use median prediction
-print("\n  Training ensemble for median selection fallback...")
-median_ensemble_models = []
-for i, seed in enumerate([111, 222, 333, 444, 555]):  # Different seeds for diversity
-    print(f"    Training median ensemble model {i+1}/5 (seed={seed})...")
-    model = XGBRegressor(
-        objective='reg:pseudohubererror',
-        max_depth=3,  # Slightly different hyperparams for diversity
-        min_child_weight=3,
-        n_estimators=300,
-        reg_alpha=0.5,
-        reg_lambda=0.5,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        random_state=seed,
-        n_jobs=-1
-    )
-    model.fit(X_train, y_reg_train, verbose=False)
-    median_ensemble_models.append(model)
-    joblib.dump(model, f'regression_median_ensemble_seed_{seed}.pkl')
-
-print(f"✅ Trained {len(median_ensemble_models)} models for median ensemble")
-
-# --- Train and Save Retweets Ensemble ---
-print("\nTraining ensemble of regression models for RETWEETS...")
-reg_models_rt = []
-# Create retweets target from the same cleaned dataframe used for train/test split
-y_reg_rt_full = np.log1p(df.loc[X.index, 'retweets'])  # Use same indices as X
-rt_mean = y_reg_rt_full.mean()
-rt_std = y_reg_rt_full.std()
-joblib.dump({'mean': rt_mean, 'std': rt_std}, 'retweets_log_scaler.pkl')
-
-# Split retweets target using the same indices as the main train/test split
-y_reg_rt_train = y_reg_rt_full.loc[X_train.index]
-y_reg_rt_test = y_reg_rt_full.loc[X_test.index]
-
-for i, seed in enumerate(reg_seeds):
-    print(f"  Training RETWEETS regression model {i+1}/{len(reg_seeds)} (seed={seed})...")
-    model = XGBRegressor(
-        objective='reg:pseudohubererror',
+# === NEW: Train NEW LIKES ensemble on log-likes (aligned with NEW heads) ===
+print("\nTraining NEW LIKES ensemble (log-space, aligned with NEW heads)...")
+new_likes_models = []
+new_reg_seeds = [42, 99, 123, 456, 789]
+for i, seed in enumerate(new_reg_seeds):
+    print(f"  Training NEW likes model {i+1}/{len(new_reg_seeds)} (seed={seed})...")
+    new_model = XGBRegressor(
+        objective='reg:pseudohubererror',  # robust on log-target
         huber_slope=2.0,
         max_depth=4,
         min_child_weight=5,
-        n_estimators=400,
+        n_estimators=500,
+        learning_rate=0.05,
         reg_alpha=1.0,
         reg_lambda=1.0,
-        max_delta_step=1,
-        subsample=0.8,
-        colsample_bytree=0.8,
+        subsample=0.85,
+        colsample_bytree=0.85,
         random_state=seed,
         n_jobs=-1,
-        early_stopping_rounds=20
+        early_stopping_rounds=30
     )
-    model.fit(X_train, y_reg_rt_train, eval_set=[(X_test, y_reg_rt_test)], verbose=False)
-    reg_models_rt.append(model)
-    joblib.dump(model, f'regression_rt_xgb_seed_{seed}.pkl')
-
-print("✅ Trained and saved RETWEETS ensemble models")
-
-# --- NEW: Quantile Regression for RETWEETS (Median) ---
-print("\nTraining quantile regression for RETWEETS (median)...")
+    new_model.fit(
+        X_likes_train, y_likes_log_train,
+        eval_set=[(X_likes_test, y_likes_log_test)],
+        verbose=False
+    )
+    new_likes_models.append(new_model)
+    joblib.dump(new_model, f'NEW_likes_model_seed_{seed}.pkl')
+print(f"✅ Trained and saved {len(new_likes_models)} NEW likes models")
+# === NEW: Quantile regression for LIKES (median/P50) ===
+print("\nTraining NEW LIKES quantile regression (median/P50)...")
 try:
-    quantile_model_rt = XGBRegressor(
+    likes_q50 = XGBRegressor(
         objective='reg:quantileerror',
-        quantile_alpha=0.5,  # Median
+        quantile_alpha=0.5,  # P50
         max_depth=4,
         min_child_weight=5,
-        n_estimators=400,
+        n_estimators=500,
+        learning_rate=0.05,
         reg_alpha=1.0,
         reg_lambda=1.0,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        random_state=2024,
         n_jobs=-1,
-        early_stopping_rounds=20
+        early_stopping_rounds=30
     )
-    quantile_model_rt.fit(X_train, y_reg_rt_train,
-                         eval_set=[(X_test, y_reg_rt_test)],
-                         verbose=False)
-    joblib.dump(quantile_model_rt, 'regression_quantile_rt_median.pkl')
-    print("✅ Trained RETWEETS quantile regression model (median)")
+    likes_q50.fit(
+        X_likes_train, y_likes_log_train,
+        eval_set=[(X_likes_test, y_likes_log_test)],
+        verbose=False
+    )
+    joblib.dump(likes_q50, 'NEW_likes_quantile_model.pkl')
+    print("✅ Saved NEW_likes_quantile_model.pkl (median)")
 except Exception as e:
-    print(f"⚠️ RETWEETS quantile regression failed: {e}")
-    quantile_model_rt = None
+    print(f"⚠️ NEW likes quantile regression failed: {e}")
+    print("Falling back to ensemble median at inference time.")
+# === NEW: Simple evaluation on test fold (denormalized likes) ===
+from sklearn.metrics import mean_absolute_error
 
-# --- Train and Save Replies Ensemble ---
-print("\nTraining ensemble of regression models for REPLIES...")
-reg_models_reply = []
-# Create replies target from the same cleaned dataframe used for train/test split
-y_reg_reply_full = np.log1p(df.loc[X.index, 'replies'])  # Use same indices as X
-reply_mean = y_reg_reply_full.mean()
-reply_std = y_reg_reply_full.std()
-joblib.dump({'mean': reply_mean, 'std': reply_std}, 'replies_log_scaler.pkl')
+def denorm_exp(x):  # expm1 of log-likes
+    return np.expm1(np.clip(x, None, 20.0))
+if new_likes_models:
+    pred_log = new_likes_models[0].predict(X_likes_test)
+    mae_likes = mean_absolute_error(np.expm1(y_likes_log_test), denorm_exp(pred_log))
+    print(f"NEW LIKES (log) ⇒ Test MAE: {mae_likes:.2f} likes")
 
-# Split replies target using the same indices as the main train/test split
-y_reg_reply_train = y_reg_reply_full.loc[X_train.index]
-y_reg_reply_test = y_reg_reply_full.loc[X_test.index]
+# --- URGENT FIX: Two-Stage Modeling System (continued) ---
+print("\nFinalizing two-stage viral detection system...")
+# Viral detector (retrain if necessary)
+if viral_detector is not None:
+    print("Retraining viral detector with updated data...")
+    viral_detector.fit(X_train[available_viral_features])
+    joblib.dump(viral_detector, 'viral_detector.pkl')
+    print("✅ Viral detector retrained and saved")
+else:
+    print("⚠️ Viral detector not available, skipping retrain")
 
-for i, seed in enumerate(reg_seeds):
-    print(f"  Training REPLIES regression model {i+1}/{len(reg_seeds)} (seed={seed})...")
-    model = XGBRegressor(
-        objective='reg:pseudohubererror',
-        huber_slope=2.0,
-        max_depth=4,
-        min_child_weight=5,
-        n_estimators=400,
-        reg_alpha=1.0,
-        reg_lambda=1.0,
-        max_delta_step=1,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=seed,
-        n_jobs=-1,
-        early_stopping_rounds=20
-    )
-    model.fit(X_train, y_reg_reply_train, eval_set=[(X_test, y_reg_reply_test)], verbose=False)
-    reg_models_reply.append(model)
-    joblib.dump(model, f'regression_reply_xgb_seed_{seed}.pkl')
+# --- Final Model Evaluation ---
+print("\n" + "="*60)
+print("FINAL MODEL EVALUATION")
+print("="*60)
+# Prepare denormalized test likes once
+y_test_denorm = safe_expm1(y_reg_test * likes_log_std + likes_log_mean)
+# Evaluate regression ensemble
+if reg_models:
+    print("\nRegression Ensemble Evaluation (MAE on test set):")
+    for i, model in enumerate(reg_models):
+        y_pred = model.predict(X_test)
+        y_pred_denorm = safe_expm1(y_pred * likes_log_std + likes_log_mean)
+        mae = mean_absolute_error(y_test_denorm, y_pred_denorm)
+        print(f"  Model {i+1}: MAE = {mae:.2f} likes")
+else:
+    print("⚠️ No regression models found for evaluation")
 
-print("✅ Trained and saved REPLIES ensemble models")
+# Evaluate NEW likes ensemble (log-space)
+if new_likes_models:
+    print("\nNEW LIKES Ensemble Evaluation (log-space, MAE on test set):")
+    for i, model in enumerate(new_likes_models):
+        y_pred_log = model.predict(X_likes_test)
+        mae_log = mean_absolute_error(np.expm1(y_likes_log_test), denorm_exp(y_pred_log))
+        print(f"  NEW Likes Model {i+1}: MAE = {mae_log:.2f} likes")
+else:
+    print("⚠️ No NEW likes models found for evaluation")
 
-# --- NEW: Quantile Regression for REPLIES (Median) ---
-print("\nTraining quantile regression for REPLIES (median)...")
+# Quantile regression model (if trained)
 try:
-    quantile_model_reply = XGBRegressor(
-        objective='reg:quantileerror',
-        quantile_alpha=0.5,  # Median
-        max_depth=4,
-        min_child_weight=5,
-        n_estimators=400,
-        reg_alpha=1.0,
-        reg_lambda=1.0,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42,
-        n_jobs=-1,
-        early_stopping_rounds=20
-    )
-    quantile_model_reply.fit(X_train, y_reg_reply_train,
-                           eval_set=[(X_test, y_reg_reply_test)],
-                           verbose=False)
-    joblib.dump(quantile_model_reply, 'regression_quantile_reply_median.pkl')
-    print("✅ Trained REPLIES quantile regression model (median)")
+    # We trained and saved this name above
+    quantile_model_likes = joblib.load('NEW_likes_quantile_model.pkl')
+    # Quantile model predicts LOG-likes on NEW_LIKES_FEATURES
+    y_pred_q50_log = quantile_model_likes.predict(X_likes_test)
+    y_pred_q50 = np.expm1(np.clip(y_pred_q50_log, None, 20.0))
+    mae_q50 = mean_absolute_error(np.expm1(y_likes_log_test), y_pred_q50)
+    print(f"\nQuantile Regression Model (P50) Evaluation: MAE = {mae_q50:.2f} likes")
 except Exception as e:
-    print(f"⚠️ REPLIES quantile regression failed: {e}")
-    quantile_model_reply = None
+    print(f"⚠️ Quantile regression model (P50) not found, skipping evaluation: {e}")
+
+# --- Final Model Saving ---
+print("\nSaving final models for production...")
+# Save regression ensemble
+for i, model in enumerate(reg_models):
+    joblib.dump(model, f'regression_xgb_seed_{reg_seeds[i]}_final.pkl')
+print(f"✅ Saved regression ensemble models")
+
+# Save NEW likes ensemble
+for i, model in enumerate(new_likes_models):
+    joblib.dump(model, f'NEW_likes_model_seed_{new_reg_seeds[i]}_final.pkl')
+print(f"✅ Saved NEW likes ensemble models")
+
+# Save quantile regression model (if trained)
+try:
+    # likes_q50 is the trained model from earlier
+    joblib.dump(likes_q50, 'NEW_likes_quantile_model_final.pkl')
+    print("✅ Saved NEW_likes_quantile_model_final.pkl (P50)")
+except Exception as e:
+    print(f"⚠️ Couldn't save quantile model: {e}")
+
+# --- Load and Test Final Models ---
+print("\nLoading and testing final models...")
+# Load regression ensemble
+final_reg_models = []
+for seed in reg_seeds:
+    try:
+        model = joblib.load(f'regression_xgb_seed_{seed}_final.pkl')
+        final_reg_models.append(model)
+    except:
+        print(f"⚠️ Failed to load regression model with seed {seed}")
+
+# Load NEW likes ensemble
+final_new_likes_models = []
+for seed in new_reg_seeds:
+    try:
+        model = joblib.load(f'NEW_likes_model_seed_{seed}_final.pkl')
+        final_new_likes_models.append(model)
+    except:
+        print(f"⚠️ Failed to load NEW likes model with seed {seed}")
+
+# Load quantile regression model (if saved)
+try:
+    final_quantile_model_likes = joblib.load('NEW_likes_quantile_model_final.pkl')
+    print("✅ Loaded NEW_likes_quantile_model_final.pkl (P50)")
+except Exception as e:
+    final_quantile_model_likes = None
+    print(f"⚠️ Quantile regression model (P50) not found, skipping load: {e}")
 
 # --- Model Comparison: Mean vs Median Predictions ---
 print("\n" + "="*60)
@@ -775,6 +852,45 @@ joblib.dump(MODEL_FEATURES, feature_order_path)
 print(f"✅ Official feature order saved to {feature_order_path}")
 print(f"✅ Feature standardization complete - {len(MODEL_FEATURES)} features locked")
 print("="*60)
+
+# === Helper: Build aligned single-row DataFrame for inference (prevents feature_names mismatch) ===
+import os
+
+def _load_feature_order(path='training_features.pkl'):
+    try:
+        return joblib.load(path)
+    except Exception:
+        # Fallbacks
+        if 'MODEL_FEATURES' in globals():
+            return MODEL_FEATURES
+        if 'features' in globals():
+            return features
+        if 'X_train' in globals():
+            return list(X_train.columns)
+        return []
+
+FEATURE_ORDER = _load_feature_order()
+
+def build_aligned_df(sample, feature_list=None):
+    """Return a single-row DataFrame exactly matching training feature order.
+    Missing features are filled with 0. Extra keys are ignored.
+    Accepts dict or single-row DataFrame.
+    """
+    if feature_list is None:
+        feature_list = FEATURE_ORDER
+    if isinstance(sample, pd.DataFrame):
+        df = sample.copy()
+        if df.shape[0] != 1:
+            df = df.iloc[[0]]
+    else:
+        df = pd.DataFrame([{f: sample.get(f, 0) for f in feature_list}])
+    # Ensure all required columns exist
+    for f in feature_list:
+        if f not in df.columns:
+            df[f] = 0
+    # Enforce ordering & drop extras
+    df = df[feature_list]
+    return df
 
 # --- Enhanced Production Prediction Class with Robust Viral Handling ---
 class RobustTweetPredictor:
@@ -1152,6 +1268,85 @@ if __name__ == "__main__":
     print("\nSample Prediction:")
     prediction = predictor.predict(sample)
     print(prediction)
+
+    # ---- Put all inference tests here (AFTER helper & classes exist) ----
+    print("\nRunning final inference test...")
+
+    test_tweet = {
+        'char_count': 120,
+        'sentiment_compound': 0.5,
+        'hashtag_count': 2,
+        'hour': 10,
+        'word_count': 20,
+        'mention_count': 1,
+        'exclamation_count': 1,
+        'question_count': 0,
+        'day_of_week': 4,
+        'is_weekend': 0
+    }
+    test_df = build_aligned_df(test_tweet)
+
+    emergency_test = {
+        'char_count': 100,
+        'sentiment_compound': 0.0,
+        'hashtag_count': 0,
+        'hour': 20,
+        'word_count': 15,
+        'mention_count': 0,
+        'exclamation_count': 0,
+        'question_count': 0,
+        'day_of_week': 3,
+        'is_weekend': 0
+    }
+    emergency_df = build_aligned_df(emergency_test)
+
+    viral_test = {
+        'char_count': 80,
+        'sentiment_compound': 0.5,
+        'hashtag_count': 0,
+        'hour': 12,
+        'word_count': 12,
+        'mention_count': 0,
+        'exclamation_count': 1,
+        'question_count': 0,
+        'day_of_week': 2,
+        'is_weekend': 0
+    }
+    viral_df_ = build_aligned_df(viral_test)
+
+    safety_test = {
+        'char_count': 10,
+        'sentiment_compound': 0.9,
+        'hashtag_count': 0,
+        'hour': 12,
+        'word_count': 5,
+        'mention_count': 0,
+        'exclamation_count': 2,
+        'question_count': 1,
+        'day_of_week': 2,
+        'is_weekend': 0
+    }
+    safety_df_ = build_aligned_df(safety_test)
+
+    if final_reg_models:
+        # NOTE: regression ensemble predicts normalized log-likes; we denormalize like you do elsewhere
+        y_pred = final_reg_models[0].predict(test_df)
+        y_pred_denorm = safe_expm1(y_pred * likes_log_std + likes_log_mean)
+        print(f"Aligned test tweet prediction: {int(y_pred_denorm[0])} likes")
+
+        emergency_pred = final_reg_models[0].predict(emergency_df)
+        emergency_denorm = safe_expm1(emergency_pred * likes_log_std + likes_log_mean)
+        print(f"Emergency test (aligned): {int(emergency_denorm[0])} likes")
+
+        viral_pred = final_reg_models[0].predict(viral_df_)
+        viral_denorm = safe_expm1(viral_pred * likes_log_std + likes_log_mean)
+        print(f"Viral test (aligned): {int(viral_denorm[0])} likes")
+
+        safety_pred = final_reg_models[0].predict(safety_df_)
+        safety_denorm = safe_expm1(safety_pred * likes_log_std + likes_log_mean)
+        print(f"Safety test (aligned): {int(safety_denorm[0])} likes")
+    else:
+        print("No regression models loaded for aligned inference tests.")
     
     # Test MVP-Ready Predictor
     print("\n" + "="*60)
