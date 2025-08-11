@@ -1,17 +1,17 @@
 {
-  "F0": 10000,
-  "alpha": {
-    "likes": 0.63,
-    "retweets": 0.73,
-    "replies": 0.55
-  },
-  "min_factor": 0.2,
-  "max_factor": 50.0,
-  "retweet_like_cap": 0.95,
-  "reply_ratio": {
-    "min": 0.01,
-    "max": 0.18,
-    "k": 1.2,
-    "pivot": 50000
-  }
+  "F0": 15000,
+  "alpha": { "likes": 0.55, "retweets": 0.68, "replies": 0.45 },
+
+  "min_factor": 0.10,
+  "max_factor": 30.0,
+
+  "retweet_like_cap": 0.85,
+
+  "visibility_rate": { "min": 0.015, "max": 0.10, "k": -2.2, "pivot": 20000 },
+  "like_rate_per_view": { "min": 0.005, "max": 0.025, "k": -1.8, "pivot": 20000 },
+
+  "rt_like_ratio":   { "min": 0.10, "max": 0.40, "k":  1.6, "pivot": 20000 },
+  "reply_like_ratio":{ "min": 0.03, "max": 0.12, "k":  1.2, "pivot": 50000 },
+
+  "baseline_blend": { "w_small": 0.25, "w_big": 0.55, "pivot": 100000 }
 }

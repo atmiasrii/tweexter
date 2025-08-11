@@ -68,12 +68,61 @@ def load_cfg():
                 for k in ("min","max","k","pivot"):
                     if k in user["reply_ratio"]:
                         cfg["reply_ratio"][k] = float(user["reply_ratio"][k])
+            
+            # inside load_cfg(), after existing keys are merged from user json:
+            for key in ("visibility_rate", "like_rate_per_view", "rt_like_ratio", "reply_like_ratio"):
+                if key in user and isinstance(user[key], dict):
+                    cfg[key] = {}  # ensure the key exists
+                    for k in ("min", "max", "k", "pivot"):
+                        if k in user[key]:
+                            cfg[key][k] = float(user[key][k])
+
+            if "baseline_blend" in user and isinstance(user["baseline_blend"], dict):
+                cfg["baseline_blend"] = {}  # ensure the key exists
+                for k in ("w_small", "w_big", "pivot"):
+                    if k in user["baseline_blend"]:
+                        cfg["baseline_blend"][k] = float(user["baseline_blend"][k])
         except Exception as e:
             print(f"⚠️ follower_scaling.json load failed; using defaults. Error: {e}")
     return cfg
 
 def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
+
+# --- follower-aware baselines on log10(N) ---
+def _logistic_on_logN(n: float, lo: float, hi: float, k: float, pivot: float) -> float:
+    x = math.log10(max(1.0, n)) - math.log10(max(1.0, pivot))
+    return lo + (hi - lo) * _sigmoid(k * x)
+
+def visibility_rate_for(followers: float, cfg: dict) -> float:
+    vr = cfg["visibility_rate"]
+    return _logistic_on_logN(followers, vr["min"], vr["max"], vr["k"], vr["pivot"])
+
+def like_rate_per_view_for(followers: float, cfg: dict) -> float:
+    lr = cfg["like_rate_per_view"]
+    return _logistic_on_logN(followers, lr["min"], lr["max"], lr["k"], lr["pivot"])
+
+def rt_like_ratio_for(followers: float, cfg: dict) -> float:
+    rr = cfg["rt_like_ratio"]
+    return _logistic_on_logN(followers, rr["min"], rr["max"], rr["k"], rr["pivot"])
+
+def reply_like_ratio_for(followers: float, cfg: dict) -> float:
+    rr = cfg["reply_like_ratio"]
+    return _logistic_on_logN(followers, rr["min"], rr["max"], rr["k"], rr["pivot"])
+
+def baselines_for(followers: float, cfg: dict) -> dict:
+    vr  = visibility_rate_for(followers, cfg)
+    lrv = like_rate_per_view_for(followers, cfg)
+    base_likes = max(1.0, followers * vr * lrv)
+    base_retweets = base_likes * rt_like_ratio_for(followers, cfg)
+    base_replies  = base_likes * reply_like_ratio_for(followers, cfg)
+    return {"likes": base_likes, "retweets": base_retweets, "replies": base_replies}
+
+def baseline_weight(followers: float, cfg: dict) -> float:
+    b = cfg["baseline_blend"]
+    # more weight on baseline for larger audiences
+    x = math.log10(max(1.0, followers)) - math.log10(max(1.0, b["pivot"]))
+    return float(b["w_small"] + (b["w_big"] - b["w_small"]) * _sigmoid(1.2 * x))
 
 def factor_for(metric: str, followers: float, cfg: dict) -> float:
     # power-law scaling: (N/F0)^alpha, with clamps
@@ -91,25 +140,32 @@ def reply_ratio_for(followers: float, cfg: dict) -> float:
     return lo + (hi - lo) * _sigmoid(k * x)
 
 def apply_follower_scaling(blended: dict, followers: float, cfg: dict) -> dict:
-    # 1) raw power-law scaling per metric
+    # 1) power-law scaling per metric (dampened by cfg alpha/F0)
     scaled = {}
     for m in ("likes", "retweets", "replies"):
         base = float(blended.get(m, 0.0))
         scaled[m] = base * factor_for(m, followers, cfg)
 
-    # 2) cross-metric consistency constraints
-    likes = max(0.0, scaled.get("likes", 0.0))
-    # retweets should not exceed a high fraction of likes
-    rt_cap = likes * float(cfg["retweet_like_cap"])
-    scaled["retweets"] = max(0.0, min(scaled.get("retweets", 0.0), rt_cap))
+    # 2) follower-aware baselines
+    base = baselines_for(followers, cfg)
+    w = baseline_weight(followers, cfg)  # 0.25..0.55
 
-    # replies proportion target vs likes using follower-aware ratio
-    rr = reply_ratio_for(followers, cfg)
-    replies_cap = likes * rr
-    # allow replies up to the cap; keep if model predicted less
-    scaled["replies"] = max(0.0, min(scaled.get("replies", 0.0), replies_cap))
+    # 3) geometric shrink toward baseline
+    blended_out = {}
+    for m in ("likes", "retweets", "replies"):
+        s = max(0.0, scaled[m])
+        b = max(1.0, base[m])
+        blended_out[m] = (s ** (1.0 - w)) * (b ** w)
 
-    return scaled
+    # 4) cross-metric sanity
+    likes = blended_out["likes"]
+    # retweets should not exceed cap relative to likes
+    blended_out["retweets"] = min(blended_out["retweets"], likes * float(cfg["retweet_like_cap"]))
+    # replies anchored by follower-aware like ratio (soft cap)
+    replies_cap = likes * reply_like_ratio_for(followers, cfg)
+    blended_out["replies"] = min(blended_out["replies"], replies_cap)
+
+    return blended_out
 
 def main():
     if len(sys.argv) < 2:
