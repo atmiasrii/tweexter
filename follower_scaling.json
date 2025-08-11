@@ -1,0 +1,17 @@
+{
+  "F0": 10000,
+  "alpha": {
+    "likes": 0.63,
+    "retweets": 0.73,
+    "replies": 0.55
+  },
+  "min_factor": 0.2,
+  "max_factor": 50.0,
+  "retweet_like_cap": 0.95,
+  "reply_ratio": {
+    "min": 0.01,
+    "max": 0.18,
+    "k": 1.2,
+    "pivot": 50000
+  }
+}

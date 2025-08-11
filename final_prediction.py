@@ -53,6 +53,139 @@ DEFAULT_GLOBAL_WEIGHTS = {
 
 BLEND_WEIGHTS_PATH = Path("blend_weights.json")
 
+# --- Dynamic blending config (no DB; rule-based) ---
+DYN_BOUNDS_DEFAULT = {
+    "likes":    (0.55, 0.98),  # min,max ML weight
+    "retweets": (0.80, 1.00),
+    "replies":  (0.00, 0.60),
+}
+
+# NEW: follower-tier blend weights
+def pick_blend_weights(followers: int):
+    try:
+        cfg = json.loads(Path("blend_weights.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    if cfg.get("force_static", False):
+        g = cfg.get("global", {})
+        return {
+            "likes": float(g.get("likes", 0.90)),
+            "retweets": float(g.get("retweets", 1.00)),
+            "replies": float(g.get("replies", 0.20)),
+        }
+
+    tiers = cfg.get("tiers", [])
+    for t in tiers:
+        mx = t.get("max_followers")
+        if (mx is None) or (followers <= int(mx)):
+            return {
+                "likes": float(t["likes"]),
+                "retweets": float(t["retweets"]),
+                "replies": float(t["replies"]),
+            }
+    return None
+
+# --- Optional post-blend calibration (piecewise / isotonic arrays) ---
+CALIBRATION_PATHS = {
+    "likes":    Path("calibration_likes.json"),
+    "retweets": Path("calibration_retweets.json"),
+    "replies":  Path("calibration_replies.json"),
+}
+
+def _load_calibration(path: Path):
+    """Expect a JSON like: {"x":[...], "y":[...], "log_space": true}."""
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        x = np.array(data.get("x", []), dtype=float)
+        y = np.array(data.get("y", []), dtype=float)
+        log_space = bool(data.get("log_space", True))
+        if x.size and y.size and x.size == y.size:
+            return {"x": x, "y": y, "log_space": log_space}
+    except Exception as e:
+        print(f"⚠️ Failed to load calibration from {path}: {e}")
+    return None
+
+CALIBRATORS = {k: _load_calibration(p) for k, p in CALIBRATION_PATHS.items()}
+
+def _apply_calibration(metric: str, value: float) -> float:
+    """Monotonic piecewise linear correction after blending."""
+    cal = CALIBRATORS.get(metric)
+    if not cal or value <= 0:
+        return float(value)
+    x, y, log_space = cal["x"], cal["y"], cal["log_space"]
+    v = np.log1p(value) if log_space else float(value)
+    v = np.clip(v, x.min(), x.max())
+    corrected = float(np.interp(v, x, y))
+    return float(np.expm1(corrected) if log_space else corrected)
+
+def _ensemble_stats_new(model_list, features_dict):
+    """For NEW heads: return p10/p50/p90 spread in original space."""
+    if not model_list:
+        return None
+    m0 = model_list[0]
+    names = getattr(m0, "feature_names_in_", None)
+    names = list(names) if names is not None else get_new_model_features()
+    X = pd.DataFrame([[features_dict.get(f, 0) for f in names]], columns=names)
+    logs = np.array([float(m.predict(X)[0]) for m in model_list])
+    vals = safe_expm1(np.clip(logs, None, 20.0))
+    p10, p50, p90 = np.percentile(vals, [10, 50, 90])
+    return {"p10": float(p10), "p50": float(p50), "p90": float(p90), "mean": float(np.mean(vals))}
+
+def _ensemble_stats_old(models, scaler, features_df):
+    """For OLD heads: compute spread from per-model preds (denormalized)."""
+    if not models:
+        return None
+    logs = np.array([float(m.predict(features_df)[0]) for m in models])
+    denorm = safe_expm1(logs * scaler.get("std", 1.0) + scaler.get("mean", 0.0))
+    p10, p50, p90 = np.percentile(denorm, [10, 50, 90])
+    return {"p10": float(p10), "p50": float(p50), "p90": float(p90), "mean": float(np.mean(denorm))}
+
+def _extract_cues(feats: dict):
+    """Tiny, human-readable rule cues derived from text features."""
+    tl = int(feats.get("text_length", 0))
+    return {
+        "qcta":      int(feats.get("question_word_count", 0) + feats.get("cta_word_count", 0) > 0),
+        "trending":  int(feats.get("trending_hashtag_count", 0) > 0),
+        "news":      int(feats.get("has_news_url", 0) == 1),
+        "short":     int(tl > 0 and tl < 80),
+        "long":      int(tl > 220),
+        "zero_sent": int(abs(float(feats.get("sentiment_compound", 0.0))) < 1e-6),
+    }
+
+def _get_bounds(weights: dict, metric: str):
+    lo = float(weights.get(f"{metric}_min_ml", DYN_BOUNDS_DEFAULT[metric][0]))
+    hi = float(weights.get(f"{metric}_max_ml", DYN_BOUNDS_DEFAULT[metric][1]))
+    lo = max(0.0, min(1.0, lo))
+    hi = max(lo, min(1.0, hi))
+    return (lo, hi)
+
+def _dynamic_weight(metric: str, base_w: float, cues: dict, stats: dict | None, bounds: tuple[float, float]) -> float:
+    """Rule-based dynamic ML weight per tweet; clamp to bounds."""
+    w = float(base_w)
+
+    # Content cues → trust ML more (esp. replies)
+    if cues["qcta"] or cues["trending"] or cues["news"]:
+        w += 0.08 if metric != "replies" else 0.15
+
+    # Uncertainty: spread = (p90 - p10)/p50
+    if stats and stats["p50"] > 0:
+        spread = (stats["p90"] - stats["p10"]) / (stats["p50"] + 1e-6)
+        if spread < 0.20:
+            w += 0.07   # confident ML
+        elif spread > 0.80:
+            w -= 0.12   # uncertain ML → lean persona a bit
+
+    # Off-distribution-ish heuristic
+    if (cues["short"] or cues["long"]) and cues["zero_sent"]:
+        w -= 0.05
+
+    lo, hi = bounds
+    return float(max(lo, min(hi, w)))
+
 def _first_existing(*paths):
     for p in paths:
         if Path(p).exists():
@@ -60,16 +193,33 @@ def _first_existing(*paths):
     return None
 
 def load_blend_weights():
-    """Load optional overrides from blend_weights.json; fall back to defaults."""
+    """Load optional overrides from blend_weights.json; fall back to defaults.
+    Supports extra keys:
+      - force_static: bool
+      - <metric>_min_ml / <metric>_max_ml, e.g. likes_min_ml: 0.6
+    """
     weights = DEFAULT_GLOBAL_WEIGHTS.copy()
+    # sensible defaults for bounds + mode flag
+    weights["force_static"] = False
+    for m in ("likes", "retweets", "replies"):
+        weights[f"{m}_min_ml"] = DYN_BOUNDS_DEFAULT[m][0]
+        weights[f"{m}_max_ml"] = DYN_BOUNDS_DEFAULT[m][1]
+
     if BLEND_WEIGHTS_PATH.exists():
         try:
             with open(BLEND_WEIGHTS_PATH, "r", encoding="utf-8") as f:
                 overrides = json.load(f)
-            for k in ["likes", "retweets", "replies"]:
+            for k in ("likes", "retweets", "replies"):
                 if k in overrides:
                     v = float(overrides[k])
-                    weights[k] = max(0.0, min(1.0, v))  # clip to [0,1]
+                    weights[k] = max(0.0, min(1.0, v))
+            # optional extras
+            weights["force_static"] = bool(overrides.get("force_static", False))
+            for m in ("likes", "retweets", "replies"):
+                if f"{m}_min_ml" in overrides:
+                    weights[f"{m}_min_ml"] = float(overrides[f"{m}_min_ml"])
+                if f"{m}_max_ml" in overrides:
+                    weights[f"{m}_max_ml"] = float(overrides[f"{m}_max_ml"])
         except Exception as e:
             print(f"⚠️ Failed to load blend_weights.json; using defaults. Error: {e}")
     return weights
@@ -283,28 +433,67 @@ def predict_blended(tweet_text: str, blend_weights: dict | None = None):
         print("⚠️ Using OLD Likes Models")
         ml_likes = predict_metric_ml_old(reg_models_likes, likes_scaler, features_df)
 
+    # --- ML distribution stats for dynamic weighting (if ensembles present) ---
+    likes_stats = (_ensemble_stats_new(new_likes_ensemble, enhanced)
+                   if new_likes_ensemble else
+                   _ensemble_stats_old(reg_models_likes, likes_scaler, features_df))
+    rt_stats    = (_ensemble_stats_new(new_rt_ensemble, enhanced)
+                   if new_rt_ensemble else
+                   _ensemble_stats_old(reg_models_rt, rt_scaler, features_df))
+    reply_stats = (_ensemble_stats_new(new_reply_ensemble, enhanced)
+                   if new_reply_ensemble else
+                   _ensemble_stats_old(reg_models_reply, reply_scaler, features_df))
+
+    cues = _extract_cues(enhanced)
+
     # Persona (as float)
     persona = aggregate_engagement(tweet_text, PERSONAS)
     persona_likes = float(persona.get("persona_likes", 0.0))
     persona_retweets = float(persona.get("persona_rts", 0.0))
     persona_replies = float(persona.get("persona_replies", 0.0))
 
-    # Global blending
-    w_likes   = float(weights.get("likes",    DEFAULT_GLOBAL_WEIGHTS["likes"]))
-    w_rts     = float(weights.get("retweets", DEFAULT_GLOBAL_WEIGHTS["retweets"]))
-    w_replies = float(weights.get("replies",  DEFAULT_GLOBAL_WEIGHTS["replies"]))
+    # Global OR Dynamic blending (respects force_static + per-metric bounds)
+    if weights.get("force_static", False):
+        w_likes   = float(weights.get("likes",    DEFAULT_GLOBAL_WEIGHTS["likes"]))
+        w_rts     = float(weights.get("retweets", DEFAULT_GLOBAL_WEIGHTS["retweets"]))
+        w_replies = float(weights.get("replies",  DEFAULT_GLOBAL_WEIGHTS["replies"]))
+        weights_mode = "static"
+    else:
+        w_likes = _dynamic_weight(
+            "likes",
+            float(weights.get("likes", DEFAULT_GLOBAL_WEIGHTS["likes"])),
+            cues, likes_stats, _get_bounds(weights, "likes")
+        )
+        w_rts = _dynamic_weight(
+            "retweets",
+            float(weights.get("retweets", DEFAULT_GLOBAL_WEIGHTS["retweets"])),
+            cues, rt_stats, _get_bounds(weights, "retweets")
+        )
+        w_replies = _dynamic_weight(
+            "replies",
+            float(weights.get("replies", DEFAULT_GLOBAL_WEIGHTS["replies"])),
+            cues, reply_stats, _get_bounds(weights, "replies")
+        )
+        weights_mode = "dynamic"
 
     blended_likes    = (ml_likes    * w_likes)   + (persona_likes    * (1.0 - w_likes))
     blended_retweets = (ml_retweets * w_rts)     + (persona_retweets * (1.0 - w_rts))
     blended_replies  = (ml_replies  * w_replies) + (persona_replies  * (1.0 - w_replies))
 
+    # Post-blend calibration (no-op if files are absent)
+    blended_likes    = _apply_calibration("likes", blended_likes)
+    blended_retweets = _apply_calibration("retweets", blended_retweets)
+    blended_replies  = _apply_calibration("replies", blended_replies)
+
     return {
         "weights_used": {"likes": w_likes, "retweets": w_rts, "replies": w_replies},
+        "weights_mode": weights_mode,
         "models_used": {
             "likes":    "NEW" if (new_likes_ensemble or new_likes_quantile) else "OLD",
             "retweets": "NEW" if (new_rt_ensemble    or new_rt_quantile)    else "OLD",
             "replies":  "NEW" if (new_reply_ensemble or new_reply_quantile) else "OLD",
         },
+        "calibration": {k: bool(CALIBRATORS.get(k)) for k in ("likes","retweets","replies")},
         "ml":      {"likes": ml_likes, "retweets": ml_retweets, "replies": ml_replies},
         "persona": {"likes": persona_likes, "retweets": persona_retweets, "replies": persona_replies},
         "blended": {"likes": blended_likes, "retweets": blended_retweets, "replies": blended_replies},
