@@ -2,7 +2,7 @@
 # FastAPI wrapper for Tweexter predictions with follower-aware scaling.
 
 from typing import Optional, Dict, Any
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Form
 from pydantic import BaseModel, Field, validator
 from starlette.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
@@ -52,6 +52,38 @@ class PredictResponse(BaseModel):
     details: Optional[Dict[str, Any]] = None
 
 
+# ---- shared compute so both JSON + FORM routes can call the same code ----
+def _compute(text: str, followers: int, return_details: bool) -> PredictResponse:
+    override_w = pick_blend_weights(followers)
+    base = predict_blended(text, override_w)
+    blended = base.get("blended", {"likes": 0.0, "retweets": 0.0, "replies": 0.0})
+
+    cfg = load_cfg()
+    adjusted = apply_follower_scaling(blended, followers, cfg)
+
+    out_likes    = int(round(adjusted.get("likes", 0.0)))
+    out_retweets = int(round(adjusted.get("retweets", 0.0)))
+    out_replies  = int(round(adjusted.get("replies", 0.0)))
+
+    payload = None
+    if return_details:
+        scales = {m: factor_for(m, followers, cfg) for m in ("likes", "retweets", "replies")}
+        payload = {
+            "followers": followers,
+            "weights_used": base.get("weights_used", {}),
+            "models_used": base.get("models_used", {}),
+            "ml_raw": base.get("ml", {}),
+            "persona_raw": base.get("persona", {}),
+            "blended_before_scaling": blended,
+            "scaling_factors": scales,
+            "follower_baselines": baselines_for(followers, cfg),
+            "baseline_weight": baseline_weight(followers, cfg),
+            "config_snapshot": cfg,
+        }
+
+    return PredictResponse(likes=out_likes, retweets=out_retweets, replies=out_replies, details=payload)
+
+
 # ---------- Routes ----------
 
 @app.get("/healthz")
@@ -67,50 +99,19 @@ async def predict(req: PredictRequest) -> PredictResponse:
     """
     Predict engagement for a single tweet.
     """
-    # heavy CPU work -> threadpool so we don't block the event loop
-    def _work() -> PredictResponse:
-        # 1) Blend-weight override picked by follower tier (if configured)
-        override_w = pick_blend_weights(req.followers)
-
-        # 2) Run base model blend (loads models at import-time; cached thereafter)
-        base = predict_blended(req.text, override_w)
-        blended = base.get("blended", {"likes": 0.0, "retweets": 0.0, "replies": 0.0})
-
-        # 3) Load follower-scaling config + apply shrink-to-baseline logic
-        cfg = load_cfg()
-        adjusted = apply_follower_scaling(blended, req.followers, cfg)
-
-        # Final rounded ints for UI
-        out_likes    = int(round(adjusted.get("likes", 0.0)))
-        out_retweets = int(round(adjusted.get("retweets", 0.0)))
-        out_replies  = int(round(adjusted.get("replies", 0.0)))
-
-        payload: Dict[str, Any] = {}
-        if req.return_details:
-            # Include helpful internals so the frontend can show a breakdown
-            scales = {m: factor_for(m, req.followers, cfg) for m in ("likes", "retweets", "replies")}
-            payload = {
-                "followers": req.followers,
-                "weights_used": base.get("weights_used", {}),
-                "models_used": base.get("models_used", {}),
-                "ml_raw": base.get("ml", {}),
-                "persona_raw": base.get("persona", {}),
-                "blended_before_scaling": blended,
-                "scaling_factors": scales,
-                "follower_baselines": baselines_for(req.followers, cfg),
-                "baseline_weight": baseline_weight(req.followers, cfg),
-                "config_snapshot": cfg,
-            }
-
-        return PredictResponse(
-            likes=out_likes,
-            retweets=out_retweets,
-            replies=out_replies,
-            details=payload if req.return_details else None,
-        )
-
     try:
-        return await run_in_threadpool(_work)
+        return await run_in_threadpool(lambda: _compute(req.text, req.followers, req.return_details))
     except Exception as e:
-        # Keep errors readable to the client; log server-side if you add logging
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {e}") from e
+
+
+@app.post("/predict-form", response_model=PredictResponse)
+async def predict_form(
+    text: str = Form(..., description="Paste tweet text (multiline OK)"),
+    followers: int = Form(..., ge=1, description="Author follower count"),
+    return_details: bool = Form(False, description="Include full breakdown"),
+) -> PredictResponse:
+    try:
+        return await run_in_threadpool(lambda: _compute(text, followers, return_details))
+    except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}") from e
