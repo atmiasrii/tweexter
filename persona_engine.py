@@ -10,7 +10,69 @@ import random
 import os
 import math
 from fuzzywuzzy import fuzz
-from textblob import TextBlob
+
+# === Fixed, reusable pool for persona simulation ===
+# WARNING: 5000 threads will require significant memory and may hit OS limits.
+# Make sure your server has enough RAM and higher ulimits.
+POOL_SIZE = 5000  # <- hard-coded as requested
+EXECUTOR = ThreadPoolExecutor(max_workers=POOL_SIZE, thread_name_prefix="persona")
+print(f"✅ PersonaEngine: created thread pool with max_workers={POOL_SIZE}")
+
+# === Performance flags & lazy NLP loaders ===
+from functools import lru_cache
+
+USE_TEXTBLOB = os.getenv("USE_TEXTBLOB", "0") == "1"     # turn on TextBlob via env if you want
+SPACY_ENABLED = os.getenv("SPACY_ENABLED", "0") == "1"   # only load spaCy if explicitly enabled
+SPACY_MODEL = os.getenv("SPACY_MODEL", "en_core_web_sm")
+
+@lru_cache(maxsize=1)
+def get_nlp():
+    """Lazy-load spaCy the first time it's actually needed."""
+    if not SPACY_ENABLED:
+        return None
+    try:
+        import spacy
+        return spacy.load(SPACY_MODEL)
+    except Exception as e:
+        print(f"⚠️ spaCy load skipped/failing ({e}); falling back to basic matching.")
+        return None
+
+@lru_cache(maxsize=1)
+def get_textblob():
+    """Lazy import TextBlob only if explicitly requested."""
+    if not USE_TEXTBLOB:
+        return None
+    try:
+        from textblob import TextBlob
+        return TextBlob
+    except Exception as e:
+        print(f"⚠️ TextBlob not available ({e}); using lightweight sentiment.")
+        return None
+
+POS_WORDS = {
+    "great","good","love","amazing","awesome","fantastic","win","profit","success","well","happy","excited","🚀","🔥","💯"
+}
+NEG_WORDS = {
+    "bad","hate","terrible","awful","fail","loss","angry","sad","worse","problem","issue","😞","💀"
+}
+
+def quick_sentiment(text: str) -> float:
+    """
+    Very light sentiment fallback: (#pos - #neg) / (len(tokens)+3) -> [-1, +1]ish
+    If USE_TEXTBLOB=1 and TextBlob is present, use it instead.
+    """
+    tb = get_textblob()
+    if tb is not None:
+        try:
+            return float(tb(text).sentiment.polarity)
+        except Exception:
+            pass
+    t = (text or "").lower().split()
+    if not t:
+        return 0.0
+    pos = sum(1 for w in t if w in POS_WORDS)
+    neg = sum(1 for w in t if w in NEG_WORDS)
+    return max(-1.0, min(1.0, (pos - neg) / (len(t) + 3)))
 
 # Import new trending hashtags module
 try:
@@ -19,13 +81,6 @@ try:
 except ImportError:
     TRENDING_MODULE_AVAILABLE = False
     print("⚠️ trending_hashtags module not available - using manual hashtag setting")
-
-try:
-    import spacy
-    nlp = spacy.load("en_core_web_sm")
-except (ImportError, OSError):
-    nlp = None
-    print("Warning: spaCy not available. Using basic content matching.")
 
 class FeedbackLearner:
     def __init__(self):
@@ -76,47 +131,45 @@ class EnhancedPersonaEngine:
         }
 
     def enhanced_content_match(self, tweet, persona):
-        """Advanced content matching using NLP and fuzzy matching"""
-        if nlp:
-            return self._nlp_content_match(tweet, persona)
+        """Advanced content matching using NLP and fuzzy matching, if spaCy is enabled."""
+        nlp = get_nlp()
+        if nlp is not None:
+            return self._nlp_content_match(tweet, persona, nlp)
         else:
             return self._basic_content_match(tweet, persona)
     
-    def _nlp_content_match(self, tweet, persona):
-        """NLP-based content matching when spaCy is available"""
+    def _nlp_content_match(self, tweet, persona, nlp):
+        """NLP-based content matching when spaCy is available (lazy-loaded)."""
         try:
             doc = nlp(tweet)
             
-            # 1. Topic matching (using ML model if available)
+            # 1) Topic matching (if you have ML model)
             topics = set(self.ml_models['topic'].predict(tweet)) if 'topic' in self.ml_models else set()
-            topic_score = len(topics & persona.content_types) * 0.3 if topics else 0
+            topic_score = len(topics & persona.content_types) * 0.3 if topics else 0.0
             
-            # 2. Keyword expansion with fuzzy matching
+            # 2) Keyword expansion with fuzzy matching (keep your existing logic)
             interests_matched = 0
             for token in doc:
                 for interest in persona.interests:
                     try:
-                        similarity_score = fuzz.partial_ratio(interest.lower(), token.text.lower())
-                        if similarity_score > 75:
+                        if fuzz.partial_ratio(interest.lower(), token.text.lower()) > 75:
                             interests_matched += 1
                             break
-                    except:
-                        # Fallback to exact match if fuzzywuzzy fails
+                    except Exception:
                         if interest.lower() in token.text.lower():
                             interests_matched += 1
                             break
             
-            # 3. Semantic triggers using spaCy similarity
+            # 3) Semantic-ish triggers with token similarity
             triggers_matched = 0
             for token in doc:
                 for trigger in persona.triggers:
                     try:
-                        trigger_doc = nlp(trigger)
-                        if token.similarity(trigger_doc[0]) > 0.65:
+                        trig = nlp(trigger)
+                        if trig and token.has_vector and trig[0].has_vector and token.similarity(trig[0]) > 0.65:
                             triggers_matched += 1
                             break
-                    except:
-                        # Fallback to basic matching
+                    except Exception:
                         if trigger.lower() in token.text.lower():
                             triggers_matched += 1
                             break
@@ -228,7 +281,7 @@ class EnhancedPersonaEngine:
     def _analyze_content(self, text):
         """Extract all NLP features from tweet text"""
         # Sentiment analysis
-        sentiment = TextBlob(text).sentiment.polarity
+        sentiment = quick_sentiment(text)
         
         # Topic classification (using your ML model)
         topics = self.ml_models['topic'].predict(text) if 'topic' in self.ml_models else self._basic_topic_detection(text)
@@ -454,11 +507,18 @@ def aggregate(results, personas=None, demographic_weights=None):
     }
 
 def parallel_engagement(tweet, personas, demographic_weights=None):
-    with ThreadPoolExecutor() as executor:
-        results = list(executor.map(
-            lambda p: simulate_persona_engagement(tweet, p), 
-            personas
-        ))
+    # Keep ALL personas; just run them in the global pool
+    try:
+        print(f"✅ PersonaEngine: using {len(personas)} personas (pool={POOL_SIZE})")
+    except Exception:
+        pass
+
+    # Map each persona to a simulation task on the global pool
+    results = list(EXECUTOR.map(
+        lambda p: simulate_persona_engagement(tweet, p),
+        personas
+    ))
+
     return aggregate(results, personas, demographic_weights)
 
 
@@ -466,7 +526,6 @@ import json
 import re
 import random
 from collections import namedtuple
-from textblob import TextBlob
 import math
 
 # Enhanced persona structure with emotional analysis
@@ -547,13 +606,13 @@ def load_personas(json_path):
                 'tone': linguistic.get('tone', 'neutral')
             }
         ))
+    print(f"✅ PersonaEngine: loaded {len(personas)} personas from {json_path}")
     return personas
 
 
 def analyze_emotion(tweet_text):
-    """Enhanced emotion analysis using TextBlob"""
-    analysis = TextBlob(tweet_text)
-    polarity = analysis.sentiment.polarity
+    """Enhanced emotion analysis using quick_sentiment"""
+    polarity = quick_sentiment(tweet_text)
     if polarity > 0.3:
         return "positive"
     elif polarity < -0.3:
@@ -572,7 +631,7 @@ def match_style(tweet_text, persona):
     tone = persona.linguistic_style['tone']
     if tone == 'formal' and any(word in tweet_text.lower() for word in ['lol', 'omg', 'wtf']):
         return 0.6
-    if tone == 'humorous' and TextBlob(tweet_text).sentiment.polarity < 0.1:
+    if tone == 'humorous' and quick_sentiment(tweet_text) < 0.1:
         return 0.7
     return 1.0  # No penalty
 

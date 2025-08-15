@@ -13,6 +13,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import time
 
 from features import extract_features_from_text, MODEL_FEATURES
 from persona_engine import load_personas, aggregate_engagement
@@ -397,6 +398,11 @@ def _pct_dict(values: list[float]) -> dict:
 # -----------------------------
 def predict_blended(tweet_text: str, blend_weights: dict | None = None):
     """Return ML, Persona, and blended predictions using global weights per metric."""
+    t_all0 = time.perf_counter()
+    timings = {}
+
+    # --- FEATURE PREP ---
+    t_feat0 = time.perf_counter()
     weights = load_blend_weights() if blend_weights is None else blend_weights
 
     # Prepare features for both NEW and OLD models
@@ -409,6 +415,11 @@ def predict_blended(tweet_text: str, blend_weights: dict | None = None):
     except Exception:
         cols = list(MODEL_FEATURES)
         features_df = pd.DataFrame([[base.get(c, 0) for c in cols]], columns=cols)
+    
+    timings["feature_extract_ms"] = int((time.perf_counter() - t_feat0) * 1000)
+
+    # --- ML PREDICTION ---
+    t_ml0 = time.perf_counter()
 
     # --- ML predictions ---
     # Retweets
@@ -457,12 +468,19 @@ def predict_blended(tweet_text: str, blend_weights: dict | None = None):
 
     cues = _extract_cues(enhanced)
 
+    timings["ml_predict_ms"] = int((time.perf_counter() - t_ml0) * 1000)
+
+    # --- PERSONA SIMULATION ---
+    t_persona0 = time.perf_counter()
     # Persona (as float)
     persona = aggregate_engagement(tweet_text, PERSONAS)
     persona_likes = float(persona.get("persona_likes", 0.0))
     persona_retweets = float(persona.get("persona_rts", 0.0))
     persona_replies = float(persona.get("persona_replies", 0.0))
+    timings["persona_sim_ms"] = int((time.perf_counter() - t_persona0) * 1000)
 
+    # --- BLEND + CALIBRATION ---
+    t_blend0 = time.perf_counter()
     # Global OR Dynamic blending (respects force_static + per-metric bounds)
     if weights.get("force_static", False):
         w_likes   = float(weights.get("likes",    DEFAULT_GLOBAL_WEIGHTS["likes"]))
@@ -524,6 +542,9 @@ def predict_blended(tweet_text: str, blend_weights: dict | None = None):
     blended_retweets = _apply_calibration("retweets", blended_retweets)
     blended_replies  = _apply_calibration("replies", blended_replies)
 
+    timings["blend_calibration_ms"] = int((time.perf_counter() - t_blend0) * 1000)
+    timings["total_predict_blended_ms"] = int((time.perf_counter() - t_all0) * 1000)
+
     return {
         "weights_used": {"likes": w_likes, "retweets": w_rts, "replies": w_replies},
         "weights_mode": weights_mode,
@@ -538,7 +559,10 @@ def predict_blended(tweet_text: str, blend_weights: dict | None = None):
         "blended": {"likes": blended_likes, "retweets": blended_retweets, "replies": blended_replies},
 
         # NEW: percentiles for uncertainty-aware ranges
-        "ml_percentiles": ml_percentiles
+        "ml_percentiles": ml_percentiles,
+
+        # NEW: timings payload
+        "timings": timings
     }
 
 # -----------------------------
@@ -572,3 +596,11 @@ if __name__ == "__main__":
     print("\n=== BLENDED PREDICTIONS ===")
     for k, v in result["blended"].items():
         print(f"{k.capitalize():8s}: {int(round(v))}")
+
+    print("\n=== TIMING BREAKDOWN ===")
+    timings = result.get("timings", {})
+    print(f"Feature Extract:     {timings.get('feature_extract_ms', 0):3d} ms")
+    print(f"ML Prediction:       {timings.get('ml_predict_ms', 0):3d} ms")
+    print(f"Persona Simulation:  {timings.get('persona_sim_ms', 0):3d} ms")
+    print(f"Blend & Calibration: {timings.get('blend_calibration_ms', 0):3d} ms")
+    print(f"Total:               {timings.get('total_predict_blended_ms', 0):3d} ms")

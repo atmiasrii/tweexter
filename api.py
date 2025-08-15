@@ -1,6 +1,10 @@
 # api.py
 # FastAPI wrapper for Tweexter predictions with follower-aware scaling.
 
+import os           # NEW
+import csv          # NEW
+import time         # NEW
+from datetime import datetime  # NEW
 import re  # NEW
 import warnings
 from typing import Optional, Dict, Any
@@ -8,6 +12,35 @@ from fastapi import FastAPI, HTTPException, Form
 from pydantic import BaseModel, Field, validator
 from starlette.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
+
+# --- timing log setup ---
+from pathlib import Path
+LOG_PATH = Path("predict_timing.csv")
+
+def _log_timing_row(row: dict) -> None:
+    """Append a single timing row to predict_timing.csv with a stable header."""
+    cols = [
+        "ts",
+        "elapsed_ms",
+        "followers",
+        "text_len",
+        "likes_mid",
+        "retweets_mid",
+        "replies_mid",
+        "weights_mode",
+        "models_likes",
+        "models_retweets",
+        "models_replies",
+    ]
+    # write header once
+    exists = LOG_PATH.exists()
+    with LOG_PATH.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        if not exists:
+            w.writeheader()
+        # keep only known keys; missing keys become empty
+        safe = {k: row.get(k, "") for k in cols}
+        w.writerow(safe)
 
 # Suppress version warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
@@ -290,15 +323,85 @@ def _apply_viral_ceiling(mid_likes: int, mid_rt: int, mid_reply: int,
     return max(curr_high_likes, v_like), max(curr_high_rt, v_rt), max(curr_high_reply, v_rep)
 
 
+# --- Timing CSV (one row per /predict) ---
+TIMING_CSV_PATH = os.getenv("TWEEXTER_TIMING_CSV", "logs/predict_timing.csv")  # NEW
+
+# --- Simple timing log setup ---
+LOG_FILE = "predict_timing.csv"
+LOG_HEADER = [
+    "ts", "duration_ms", "endpoint", "followers", "text_len",
+    "likes_mid", "retweets_mid", "replies_mid", "weights_mode"
+]
+
+def _ensure_timing_log():
+    if not os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(LOG_HEADER)
+
+def _append_timing_row(duration_ms: float, endpoint: str, followers: int, text_len: int,
+                       likes_mid: int, retweets_mid: int, replies_mid: int, weights_mode):
+    _ensure_timing_log()
+    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            datetime.utcnow().isoformat(timespec="seconds"),
+            int(round(duration_ms)),
+            endpoint,
+            int(followers),
+            int(text_len),
+            int(likes_mid),
+            int(retweets_mid),
+            int(replies_mid),
+            weights_mode or ""
+        ])
+
+def _append_timing_csv(row: dict) -> None:
+    """
+    Append a single row to the timing CSV. Creates folder and header automatically.
+    """
+    try:
+        os.makedirs(os.path.dirname(TIMING_CSV_PATH), exist_ok=True)
+    except Exception:
+        # if path is just a filename with no directory
+        pass
+
+    file_exists = os.path.exists(TIMING_CSV_PATH)
+    fieldnames = [
+        "ts", "followers", "text_len",
+        "likes_mid", "rts_mid", "replies_mid",
+        "likes_low", "likes_high", "rts_low", "rts_high", "replies_low", "replies_high",
+        "feat_ms", "ml_ms", "persona_ms", "calibration_ms",
+        "scaling_ms", "ranges_ms",
+        "predict_blended_total_ms", "route_total_ms",
+        "models_likes", "models_retweets", "models_replies",
+        "weights_mode"
+    ]
+
+    # open with newline='' per csv docs to avoid extra blank lines on Windows
+    with open(TIMING_CSV_PATH, mode="a", encoding="utf-8", newline="") as f:  # NEW
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        # only write columns we know; ignore extras
+        safe_row = {k: row.get(k, "") for k in fieldnames}
+        writer.writerow(safe_row)
+
+
 # ---- shared compute so both JSON + FORM routes can call the same code ----
 def _compute(text: str, followers: int, return_details: bool) -> PredictResponse:
+    t_route0 = time.perf_counter()  # NEW
+
     override_w = pick_blend_weights(followers)
+    t_pred0 = time.perf_counter()  # NEW
     base = predict_blended(text, override_w)
+    t_pred_ms = int((time.perf_counter() - t_pred0) * 1000)  # total predict_blended wall time (backup)
     blended = base.get("blended", {"likes": 0.0, "retweets": 0.0, "replies": 0.0})
 
     # Apply follower scaling first to get baseline predictions
     cfg = load_cfg()
+    
+    t_scale0 = time.perf_counter()  # NEW
     adjusted = apply_follower_scaling(blended, followers, cfg)
+    scaling_ms = int((time.perf_counter() - t_scale0) * 1000)  # NEW
     
     out_likes    = int(round(adjusted.get("likes", 0.0)))
     out_retweets = int(round(adjusted.get("retweets", 0.0)))
@@ -309,6 +412,8 @@ def _compute(text: str, followers: int, return_details: bool) -> PredictResponse
     range_source = str(ranges_cfg.get("source", "backend")).lower()
     viral_upper_enabled = bool(ranges_cfg.get("viral_upper_enabled", True))
     
+    # Build ranges and time them
+    t_ranges0 = time.perf_counter()  # NEW
     if (not ranges_enabled) or (range_source != "backend"):
         # Return mid-only; frontend can compute ranges using same rules
         ranges = {
@@ -316,6 +421,38 @@ def _compute(text: str, followers: int, return_details: bool) -> PredictResponse
             "retweets": {"low": out_retweets, "mid": out_retweets, "high": out_retweets},
             "replies":  {"low": out_replies,  "mid": out_replies,  "high": out_replies},
         }
+        ranges_ms = int((time.perf_counter() - t_ranges0) * 1000)  # NEW
+        route_total_ms = int((time.perf_counter() - t_route0) * 1000)  # NEW
+        
+        # --- Append timing CSV (NEW) ---
+        btim = base.get("timings", {})  # returned from final_prediction
+        _append_timing_csv({
+            "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "followers": followers,
+            "text_len": len(text or ""),
+            "likes_mid": out_likes,
+            "rts_mid": out_retweets,
+            "replies_mid": out_replies,
+            "likes_low": ranges["likes"]["low"],
+            "likes_high": ranges["likes"]["high"],
+            "rts_low": ranges["retweets"]["low"],
+            "rts_high": ranges["retweets"]["high"],
+            "replies_low": ranges["replies"]["low"],
+            "replies_high": ranges["replies"]["high"],
+            "feat_ms": btim.get("feature_extract_ms", ""),
+            "ml_ms": btim.get("ml_predict_ms", ""),
+            "persona_ms": btim.get("persona_sim_ms", ""),
+            "calibration_ms": btim.get("blend_calibration_ms", ""),
+            "scaling_ms": scaling_ms,
+            "ranges_ms": ranges_ms,
+            "predict_blended_total_ms": btim.get("total_predict_blended_ms", t_pred_ms),
+            "route_total_ms": route_total_ms,
+            "models_likes": base.get("models_used", {}).get("likes", ""),
+            "models_retweets": base.get("models_used", {}).get("retweets", ""),
+            "models_replies": base.get("models_used", {}).get("replies", ""),
+            "weights_mode": base.get("weights_mode", "")
+        })
+        
         return PredictResponse(
             likes=out_likes, retweets=out_retweets, replies=out_replies,
             ranges=ranges,
@@ -394,6 +531,38 @@ def _compute(text: str, followers: int, return_details: bool) -> PredictResponse
         "replies":  {"low": reply_low,  "mid": out_replies,  "high": reply_high},
     }
 
+    ranges_ms = int((time.perf_counter() - t_ranges0) * 1000)  # NEW
+    route_total_ms = int((time.perf_counter() - t_route0) * 1000)  # NEW
+
+    # --- Append timing CSV (NEW) ---
+    btim = base.get("timings", {})  # returned from final_prediction
+    _append_timing_csv({
+        "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "followers": followers,
+        "text_len": len(text or ""),
+        "likes_mid": out_likes,
+        "rts_mid": out_retweets,
+        "replies_mid": out_replies,
+        "likes_low": ranges["likes"]["low"],
+        "likes_high": ranges["likes"]["high"],
+        "rts_low": ranges["retweets"]["low"],
+        "rts_high": ranges["retweets"]["high"],
+        "replies_low": ranges["replies"]["low"],
+        "replies_high": ranges["replies"]["high"],
+        "feat_ms": btim.get("feature_extract_ms", ""),
+        "ml_ms": btim.get("ml_predict_ms", ""),
+        "persona_ms": btim.get("persona_sim_ms", ""),
+        "calibration_ms": btim.get("blend_calibration_ms", ""),
+        "scaling_ms": scaling_ms,
+        "ranges_ms": ranges_ms,
+        "predict_blended_total_ms": btim.get("total_predict_blended_ms", t_pred_ms),
+        "route_total_ms": route_total_ms,
+        "models_likes": base.get("models_used", {}).get("likes", ""),
+        "models_retweets": base.get("models_used", {}).get("retweets", ""),
+        "models_replies": base.get("models_used", {}).get("replies", ""),
+        "weights_mode": base.get("weights_mode", "")
+    })
+
     payload = None
     if return_details:
         scales = {m: factor_for(m, followers, cfg) for m in ("likes", "retweets", "replies")}
@@ -443,9 +612,45 @@ async def predict(req: PredictRequest) -> PredictResponse:
     """
     Predict engagement for a single tweet.
     """
+    t0 = time.perf_counter()
     try:
-        return await run_in_threadpool(lambda: _compute(req.text, req.followers, req.return_details))
+        resp = await run_in_threadpool(lambda: _compute(req.text, req.followers, req.return_details))
+        elapsed_ms = int(round((time.perf_counter() - t0) * 1000))
+
+        # pull a few details for the log (guarded in case details are off)
+        details = getattr(resp, "details", None) or {}
+        weights_mode = details.get("weights_used") and details.get("weights_mode", "")
+        models_used = details.get("models_used", {}) if isinstance(details.get("models_used", {}), dict) else {}
+        _log_timing_row({
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed_ms": elapsed_ms,
+            "followers": req.followers,
+            "text_len": len(req.text or ""),
+            "likes_mid": resp.likes,
+            "retweets_mid": resp.retweets,
+            "replies_mid": resp.replies,
+            "weights_mode": details.get("weights_mode", ""),
+            "models_likes": models_used.get("likes", ""),
+            "models_retweets": models_used.get("retweets", ""),
+            "models_replies": models_used.get("replies", ""),
+        })
+        return resp
     except Exception as e:
+        # still log a timing row on failure (with mids blank)
+        elapsed_ms = int(round((time.perf_counter() - t0) * 1000))
+        _log_timing_row({
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed_ms": elapsed_ms,
+            "followers": req.followers,
+            "text_len": len(req.text or ""),
+            "likes_mid": "",
+            "retweets_mid": "",
+            "replies_mid": "",
+            "weights_mode": "error",
+            "models_likes": "",
+            "models_retweets": "",
+            "models_replies": "",
+        })
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}") from e
 
 
@@ -455,7 +660,43 @@ async def predict_form(
     followers: int = Form(..., ge=1, description="Author follower count"),
     return_details: bool = Form(False, description="Include full breakdown"),
 ) -> PredictResponse:
+    t0 = time.perf_counter()
     try:
-        return await run_in_threadpool(lambda: _compute(text, followers, return_details))
+        resp = await run_in_threadpool(lambda: _compute(text, followers, return_details))
+        elapsed_ms = int(round((time.perf_counter() - t0) * 1000))
+
+        # pull a few details for the log (guarded in case details are off)
+        details = getattr(resp, "details", None) or {}
+        weights_mode = details.get("weights_used") and details.get("weights_mode", "")
+        models_used = details.get("models_used", {}) if isinstance(details.get("models_used", {}), dict) else {}
+        _log_timing_row({
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed_ms": elapsed_ms,
+            "followers": followers,
+            "text_len": len(text or ""),
+            "likes_mid": resp.likes,
+            "retweets_mid": resp.retweets,
+            "replies_mid": resp.replies,
+            "weights_mode": details.get("weights_mode", ""),
+            "models_likes": models_used.get("likes", ""),
+            "models_retweets": models_used.get("retweets", ""),
+            "models_replies": models_used.get("replies", ""),
+        })
+        return resp
     except Exception as e:
+        # still log a timing row on failure (with mids blank)
+        elapsed_ms = int(round((time.perf_counter() - t0) * 1000))
+        _log_timing_row({
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed_ms": elapsed_ms,
+            "followers": followers,
+            "text_len": len(text or ""),
+            "likes_mid": "",
+            "retweets_mid": "",
+            "replies_mid": "",
+            "weights_mode": "error",
+            "models_likes": "",
+            "models_retweets": "",
+            "models_replies": "",
+        })
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}") from e
