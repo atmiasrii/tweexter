@@ -1,8 +1,89 @@
 import re
 import string
-import datetime
 import numpy as np
 from nltk.sentiment import SentimentIntensityAnalyzer
+
+# ---- BEGIN required-field helpers (add once near top) ----
+from datetime import datetime
+
+NEWS_DOMAINS = ('bbc.', 'cnn.', 'nytimes.', 'reuters.', 'techcrunch.', 'washingtonpost.', 'theguardian.')
+
+QUESTION_WORDS = ("what","how","why","when","where","who","which")
+CTA_WORDS = ("please","help","share","comment","reply","thoughts","rt","retweet","dm","join","sign up")
+
+try:
+    from textblob import TextBlob
+    _HAS_TEXTBLOB = True
+except Exception:
+    _HAS_TEXTBLOB = False
+
+def _has_url(text: str) -> int:
+    return 1 if re.search(r'https?://', text or '') else 0
+
+def _has_news_url(text: str) -> int:
+    if not text:
+        return 0
+    urls = re.findall(r'https?://[^\s]+', text)
+    return 1 if any(any(nd in u for nd in NEWS_DOMAINS) for u in urls) else 0
+
+def _count_question_words(text: str) -> int:
+    tl = (text or "").lower()
+    return sum(tl.count(w) for w in QUESTION_WORDS)
+
+def _count_cta_words(text: str) -> int:
+    tl = (text or "").lower()
+    return sum(tl.count(w) for w in CTA_WORDS)
+
+def _safe_sentiment(text: str):
+    if _HAS_TEXTBLOB:
+        try:
+            s = TextBlob(text or "")
+            return float(s.sentiment.polarity), float(s.sentiment.subjectivity)
+        except Exception:
+            pass
+    # fallback
+    return 0.0, 0.5
+
+def _augment_required_fields(text: str, feats: dict) -> dict:
+    """Ensure the API-required keys exist with sane values."""
+    t = text or ""
+    # basic counts
+    feats.setdefault("char_count", len(t))
+    feats.setdefault("word_count", len(re.findall(r"\b\w+\b", t)))
+    feats.setdefault("sentence_count", max(1, t.count(".") + t.count("!") + t.count("?")))
+    feats.setdefault("hashtag_count", len(re.findall(r"#\w+", t)))
+    feats.setdefault("mention_count", len(re.findall(r"@\w+", t)))
+    feats.setdefault("question_count", t.count("?"))
+    feats.setdefault("exclamation_count", t.count("!"))
+
+    # time-ish defaults (override upstream if you know the real ones)
+    feats.setdefault("day_of_week", datetime.now().weekday())
+    feats.setdefault("is_weekend", 1 if feats["day_of_week"] >= 5 else 0)
+    feats.setdefault("hour", 12)
+
+    # text/meta
+    feats.setdefault("text_length", len(t))
+    feats.setdefault("has_media", 0)
+    feats["has_url"] = _has_url(t)
+    feats["has_news_url"] = _has_news_url(t)
+
+    # cues needed by API
+    feats.setdefault("question_word_count", _count_question_words(t))
+    feats.setdefault("cta_word_count", _count_cta_words(t))
+    feats.setdefault("trending_hashtag_count", 0)   # real trending module may overwrite elsewhere
+
+    # model-friendly extras (safe defaults)
+    sc, ss = _safe_sentiment(t)
+    feats.setdefault("sentiment_compound", sc)
+    feats.setdefault("sentiment_subjectivity", ss)
+    for emo in ("anger","fear","joy","sadness","surprise"):
+        feats.setdefault(f"emotion_{emo}", 0.0)
+
+    # topic id/category if you don't have a classifier
+    feats.setdefault("topic_category", 0)
+
+    return feats
+# ---- END required-field helpers ----
 
 # Import new modules for optional extended features
 try:
@@ -33,28 +114,45 @@ def _hf_preprocess(text: str) -> str:
 def _lazy_load_hf():
     global _tokenizer, _hf_model
     if _tokenizer is None or _hf_model is None:
-        from transformers import AutoTokenizer, AutoModelForSequenceClassification
-        import torch
-        _tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_ID)
-        _hf_model = AutoModelForSequenceClassification.from_pretrained(HF_MODEL_ID)
-        _hf_model.eval()
+        import warnings
+        import os
+        # Suppress all transformers warnings
+        warnings.filterwarnings("ignore")
+        os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            from transformers import AutoTokenizer, AutoModelForSequenceClassification
+            import torch
+            _tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_ID, verbose=False)
+            _hf_model = AutoModelForSequenceClassification.from_pretrained(HF_MODEL_ID, verbose=False)
+            _hf_model.eval()
 
 def _sentiment_compound(text: str) -> float:
     """Prefer Twitter-RoBERTa; fallback to VADER if unavailable."""
     try:
+        if not text or len(text.strip()) == 0:
+            return 0.0
+            
         _lazy_load_hf()
         from scipy.special import softmax
         import torch
         txt = _hf_preprocess(text)
-        inputs = _tokenizer(txt, return_tensors="pt", truncation=True)
+        inputs = _tokenizer(txt, return_tensors="pt", truncation=True, max_length=512, padding=True)
         with torch.no_grad():
             logits = _hf_model(**inputs).logits[0].cpu().numpy()
         p_neg, p_neu, p_pos = softmax(logits).tolist()
         # map to [-1, 1]-ish scale to replace VADER's 'compound'
         return float(p_pos - p_neg)
-    except Exception:
-        # fallback: VADER
-        return float(sia.polarity_scores(text)["compound"])
+    except Exception as e:
+        # fallback: VADER (with better error handling)
+        try:
+            if text and len(text.strip()) > 0:
+                return float(sia.polarity_scores(text)["compound"])
+            else:
+                return 0.0
+        except Exception:
+            return 0.0
 
 MODEL_FEATURES = [
     'char_count', 'word_count', 'sentence_count', 'avg_word_length', 'uppercase_ratio',
@@ -92,7 +190,7 @@ def extract_features_from_text(text, tweet_time=None):
 
     # --- Time Features (assume now if not provided) ---
     if tweet_time is None:
-        now = datetime.datetime.now()
+        now = datetime.now()
     else:
         now = tweet_time
     hour = now.hour
@@ -159,6 +257,10 @@ def extract_features_from_text(text, tweet_time=None):
     }
     # Return only the features in the exact required order!
     ordered_features = {k: features[k] for k in MODEL_FEATURES}
+    
+    # >>> ADD THIS LINE right before returning:
+    ordered_features = _augment_required_fields(text, ordered_features)
+    
     return ordered_features
 
 def extract_extended_features_from_text(text, tweet_time=None):
@@ -193,6 +295,9 @@ def extract_extended_features_from_text(text, tweet_time=None):
         features[f'emotion_{emo}'] = 0.0
     
     features['sentiment_subjectivity'] = 0.5  # placeholder
+    
+    # >>> ADD THIS LINE right before returning:
+    features = _augment_required_fields(text, features)
     
     return features
 

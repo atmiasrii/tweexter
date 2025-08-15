@@ -60,32 +60,6 @@ DYN_BOUNDS_DEFAULT = {
     "replies":  (0.00, 0.60),
 }
 
-# NEW: follower-tier blend weights
-def pick_blend_weights(followers: int):
-    try:
-        cfg = json.loads(Path("blend_weights.json").read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-    if cfg.get("force_static", False):
-        g = cfg.get("global", {})
-        return {
-            "likes": float(g.get("likes", 0.90)),
-            "retweets": float(g.get("retweets", 1.00)),
-            "replies": float(g.get("replies", 0.20)),
-        }
-
-    tiers = cfg.get("tiers", [])
-    for t in tiers:
-        mx = t.get("max_followers")
-        if (mx is None) or (followers <= int(mx)):
-            return {
-                "likes": float(t["likes"]),
-                "retweets": float(t["retweets"]),
-                "replies": float(t["replies"]),
-            }
-    return None
-
 # --- Optional post-blend calibration (piecewise / isotonic arrays) ---
 CALIBRATION_PATHS = {
     "likes":    Path("calibration_likes.json"),
@@ -381,6 +355,43 @@ def _predict_new_core(model_or_list, features_dict):
         return 0.0
     return float(min(safe_expm1(log_pred), 100000.0))
 
+
+# --- NEW: helpers to get ensemble/old-model percentiles on ORIGINAL scale ---
+def _ensemble_preds(models_or_list, features_dict) -> list[float]:
+    """Return list of per-model predictions on original (expm1) scale."""
+    if not models_or_list:
+        return []
+    models = models_or_list if isinstance(models_or_list, list) else [models_or_list]
+    m0 = models[0]
+    feature_names = getattr(m0, "feature_names_in_", None)
+    names = list(feature_names) if feature_names is not None else get_new_model_features()
+    X = pd.DataFrame([[features_dict.get(f, 0) for f in names]], columns=names)
+    logs = [float(m.predict(X)[0]) for m in models]
+    vals = [float(min(safe_expm1(lp), 100000.0)) for lp in logs]
+    return vals
+
+def _old_ensemble_preds(models, features_df) -> list[float]:
+    """Return list of per-model predictions on original scale using OLD models & scalers are applied via existing helper."""
+    if not models:
+        return []
+    # NOTE: OLD models were trained in log space; we reuse your existing predict path per model
+    preds = []
+    for m in models:
+        # emulate your old averaging path but per-model
+        base_log = float(m.predict(features_df)[0])
+        preds.append(float(max(0.0, safe_expm1(base_log))) )  # unscaled single-model view
+    return preds
+
+def _pct_dict(values: list[float]) -> dict:
+    if not values:
+        return {}
+    arr = np.array(values, dtype=float)
+    return {
+        "p10": float(np.percentile(arr, 10)),
+        "p50": float(np.percentile(arr, 50)),
+        "p90": float(np.percentile(arr, 90)),
+    }
+
 # -----------------------------
 # Main blend function
 # -----------------------------
@@ -480,6 +491,34 @@ def predict_blended(tweet_text: str, blend_weights: dict | None = None):
     blended_retweets = (ml_retweets * w_rts)     + (persona_retweets * (1.0 - w_rts))
     blended_replies  = (ml_replies  * w_replies) + (persona_replies  * (1.0 - w_replies))
 
+    # --- NEW: expose ML percentile spreads for uncertainty-aware ranges ---
+    ml_percentiles = {}
+
+    # Likes
+    if new_likes_ensemble:
+        preds = _ensemble_preds(new_likes_ensemble, enhanced)
+        ml_percentiles["likes"] = _pct_dict(preds)
+    elif reg_models_likes:
+        # approximate spread from OLD models if NEW absent
+        preds = _old_ensemble_preds(reg_models_likes, features_df)
+        ml_percentiles["likes"] = _pct_dict(preds)
+
+    # Retweets
+    if new_rt_ensemble:
+        preds = _ensemble_preds(new_rt_ensemble, enhanced)
+        ml_percentiles["retweets"] = _pct_dict(preds)
+    elif reg_models_rt:
+        preds = _old_ensemble_preds(reg_models_rt, features_df)
+        ml_percentiles["retweets"] = _pct_dict(preds)
+
+    # Replies
+    if new_reply_ensemble:
+        preds = _ensemble_preds(new_reply_ensemble, enhanced)
+        ml_percentiles["replies"] = _pct_dict(preds)
+    elif reg_models_reply:
+        preds = _old_ensemble_preds(reg_models_reply, features_df)
+        ml_percentiles["replies"] = _pct_dict(preds)
+
     # Post-blend calibration (no-op if files are absent)
     blended_likes    = _apply_calibration("likes", blended_likes)
     blended_retweets = _apply_calibration("retweets", blended_retweets)
@@ -497,6 +536,9 @@ def predict_blended(tweet_text: str, blend_weights: dict | None = None):
         "ml":      {"likes": ml_likes, "retweets": ml_retweets, "replies": ml_replies},
         "persona": {"likes": persona_likes, "retweets": persona_retweets, "replies": persona_replies},
         "blended": {"likes": blended_likes, "retweets": blended_retweets, "replies": blended_replies},
+
+        # NEW: percentiles for uncertainty-aware ranges
+        "ml_percentiles": ml_percentiles
     }
 
 # -----------------------------

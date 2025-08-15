@@ -22,7 +22,47 @@ DEFAULT_CFG = {
     # sanity constraints to keep metrics realistic relative to each other
     "retweet_like_cap": 0.95,  # retweets should rarely exceed likes
     # replies are a small share of likes that grows slowly with audience size
-    "reply_ratio": {"min": 0.01, "max": 0.18, "k": 1.2, "pivot": 50000}
+    "reply_ratio": {"min": 0.01, "max": 0.18, "k": 1.2, "pivot": 50000},
+
+    # --- RANGES / FEATURE FLAGS (used by API) ---
+    "ranges": {
+        "enabled": True,                 # master switch for ranges
+        "source": "backend",             # "backend" | "frontend"
+        "viral_upper_enabled": True,     # allow viral ceiling bump
+
+        # follower-tier → default ±band (relative)
+        "tier_bands": [
+            {"max_followers": 1000,     "band": 0.50},
+            {"max_followers": 5000,     "band": 0.35},
+            {"max_followers": 10000,    "band": 0.30},
+            {"max_followers": 50000,    "band": 0.25},
+            {"max_followers": 100000,   "band": 0.22},
+            {"max_followers": 300000,   "band": 0.20},
+            {"max_followers": 600000,   "band": 0.18},
+            {"max_followers": 1000000,  "band": 0.16},
+            {"max_followers": None,     "band": 0.15}
+        ],
+
+        # (10) Small-number safeguards → absolute floors for bands
+        "floors": {"likes": 8, "retweets": 5, "replies": 2},
+
+        # Per-metric band scaling vs likes band
+        "retweet_band_scale": 0.70,
+        "reply_band_scale":   0.50,
+
+        # Content-cue bumps (multiplicative on UPPER bounds, e.g. +0.15 = +15%)
+        "cue_bumps": {
+            "trending":        0.15,
+            "news":            0.10,
+            "short_positive":  0.10,
+            "qa_cta_like":     0.05,   # small like bump when Q/CTA
+            "qa_cta_reply":    0.25,   # bigger reply bump when Q/CTA
+            "nonnews_link":   -0.10    # shave upper if external non-news link
+        },
+
+        # Viral caps for ceiling rule (step 6): mid * cap
+        "viral_caps": {"likes": 3.0, "retweets": 3.0, "replies": 2.0}
+    }
 }
 
 # NEW: follower-tier blend weights
@@ -82,6 +122,17 @@ def load_cfg():
                 for k in ("w_small", "w_big", "pivot"):
                     if k in user["baseline_blend"]:
                         cfg["baseline_blend"][k] = float(user["baseline_blend"][k])
+
+            # --- RANGES / FEATURE FLAGS (deep-merge) ---
+            if "ranges" in user and isinstance(user["ranges"], dict):
+                # start from defaults
+                base_ranges = cfg.get("ranges", {}).copy()
+                for k, v in user["ranges"].items():
+                    if isinstance(v, dict):
+                        base_ranges[k] = {**base_ranges.get(k, {}), **v}
+                    else:
+                        base_ranges[k] = v
+                cfg["ranges"] = base_ranges
         except Exception as e:
             print(f"⚠️ follower_scaling.json load failed; using defaults. Error: {e}")
     return cfg

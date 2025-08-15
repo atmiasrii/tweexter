@@ -130,6 +130,11 @@ from typing import Dict, List, Tuple, Optional, Union
 from multiprocessing import Pool, cpu_count
 import multiprocessing as mp
 
+# Suppress version warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+warnings.filterwarnings("ignore", message=".*XGBoost.*")
+warnings.filterwarnings("ignore", message=".*InconsistentVersionWarning.*")
+
 # Data Science
 import pandas as pd
 import numpy as np

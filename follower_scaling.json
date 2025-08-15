@@ -13,5 +13,38 @@
   "rt_like_ratio":   { "min": 0.10, "max": 0.40, "k":  1.6, "pivot": 20000 },
   "reply_like_ratio":{ "min": 0.03, "max": 0.12, "k":  1.2, "pivot": 50000 },
 
-  "baseline_blend": { "w_small": 0.25, "w_big": 0.55, "pivot": 100000 }
+  "baseline_blend": { "w_small": 0.25, "w_big": 0.55, "pivot": 100000 },
+
+  "ranges": {
+    "enabled": true,
+    "source": "backend",
+    "viral_upper_enabled": true,
+
+    "tier_bands": [
+      { "max_followers": 1000,     "band": 0.50 },
+      { "max_followers": 5000,     "band": 0.35 },
+      { "max_followers": 10000,    "band": 0.30 },
+      { "max_followers": 50000,    "band": 0.25 },
+      { "max_followers": 100000,   "band": 0.22 },
+      { "max_followers": 300000,   "band": 0.20 },
+      { "max_followers": 600000,   "band": 0.18 },
+      { "max_followers": 1000000,  "band": 0.16 },
+      { "max_followers": null,     "band": 0.15 }
+    ],
+
+    "floors": { "likes": 8, "retweets": 5, "replies": 2 },
+    "retweet_band_scale": 0.70,
+    "reply_band_scale":   0.50,
+
+    "cue_bumps": {
+      "trending":        0.15,
+      "news":            0.10,
+      "short_positive":  0.10,
+      "qa_cta_like":     0.05,
+      "qa_cta_reply":    0.25,
+      "nonnews_link":   -0.10
+    },
+
+    "viral_caps": { "likes": 3.0, "retweets": 3.0, "replies": 2.0 }
+  }
 }
