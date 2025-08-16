@@ -1,0 +1,17 @@
+{
+  "force_static": false,
+
+  "global": { "likes": 0.90, "retweets": 1.00, "replies": 0.20 },
+
+  "tiers": [
+    { "max_followers": 1000,    "likes": 0.60,  "retweets": 0.90, "replies": 0.05 },
+    { "max_followers": 5000,    "likes": 0.70,  "retweets": 0.95, "replies": 0.10 },
+    { "max_followers": 10000,   "likes": 0.80,  "retweets": 0.98, "replies": 0.15 },
+    { "max_followers": 50000,   "likes": 0.90,  "retweets": 1.00, "replies": 0.20 },
+    { "max_followers": 100000,  "likes": 0.94,  "retweets": 1.00, "replies": 0.22 },
+    { "max_followers": 300000,  "likes": 0.96,  "retweets": 1.00, "replies": 0.25 },
+    { "max_followers": 600000,  "likes": 0.97,  "retweets": 1.00, "replies": 0.28 },
+    { "max_followers": 1000000, "likes": 0.98,  "retweets": 1.00, "replies": 0.30 },
+    { "max_followers": null,    "likes": 0.985, "retweets": 1.00, "replies": 0.35 }
+  ]
+}

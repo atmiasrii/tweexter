@@ -1,0 +1,316 @@
+{
+  "audit_timestamp": "2025-08-06T19:36:25.487646",
+  "summary_stats": {
+    "likes_range": 126.04190468000763,
+    "retweets_range": 66.74142586800548,
+    "replies_range": 123.9573835199943,
+    "likes_std": 17.65706402574162,
+    "retweets_std": 9.257793485390978,
+    "replies_std": 23.618880311535268,
+    "total_predictions": 6
+  },
+  "input_factors": {
+    "follower_count": 4640,
+    "emotional_triggers": 4975,
+    "dealbreakers": 4975,
+    "pet_peeves": 5000,
+    "content_types": 5000,
+    "total_personas": 5000
+  },
+  "bottlenecks": [
+    "Over-reliance on follower count",
+    "Lack of content-aware features (interests)",
+    "Overly consistent like predictions (low variance)",
+    "Overly consistent retweet predictions (low variance)",
+    "Similar engaged persona counts across different tweets"
+  ],
+  "accuracy_analysis": {
+    "predictions_with_actuals": 6,
+    "avg_like_error": 622.644551183335,
+    "avg_retweet_error": 242.33602886599922,
+    "avg_reply_error": 151.89083174666516
+  },
+  "sample_predictions": [
+    {
+      "timestamp": "2025-08-06T19:36:02.769520",
+      "tweet_text": "Just had the best coffee ever! \u2615\ufe0f #MondayMotivation",
+      "predicted": {
+        "likes": 524.2263786799966,
+        "retweets": 262.0550792079948,
+        "replies": 154.9467294000021
+      },
+      "actual": {
+        "likes": 42,
+        "retweets": 3,
+        "replies": 5
+      },
+      "engaged_personas_count": 20,
+      "top_segments": [
+        {
+          "segment": "eSports Athlete (Pro Gamer)",
+          "engagement_score": 0.091,
+          "match_factors": {
+            "content": 1.0,
+            "emotion": 0.7,
+            "interests": 1.0,
+            "triggers": 1.0,
+            "style": 1.0,
+            "question_boost": 1.0,
+            "controversy_boost": 1.0
+          }
+        },
+        {
+          "segment": "Politician",
+          "engagement_score": 0.091,
+          "match_factors": {
+            "content": 1.0,
+            "emotion": 0.7,
+            "interests": 1.0,
+            "triggers": 1.0,
+            "style": 1.0,
+            "question_boost": 1.0,
+            "controversy_boost": 1.0
+          }
+        },
+        {
+          "segment": "Streamer",
+          "engagement_score": 0.091,
+          "match_factors": {
+            "content": 1.0,
+            "emotion": 0.7,
+            "interests": 1.0,
+            "triggers": 1.0,
+            "style": 1.0,
+            "question_boost": 1.0,
+            "controversy_boost": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "timestamp": "2025-08-06T19:36:07.672111",
+      "tweet_text": "BREAKING: New study shows remote work increases productivity by 47% \ud83d\udcc8",
+      "predicted": {
+        "likes": 554.1514461199961,
+        "retweets": 279.17333407199646,
+        "replies": 278.9041129199964
+      },
+      "actual": {
+        "likes": 2100,
+        "retweets": 950,
+        "replies": 180
+      },
+      "engaged_personas_count": 20,
+      "top_segments": [
+        {
+          "segment": "Politician",
+          "engagement_score": 0.10919999999999999,
+          "match_factors": {
+            "content": 1.2,
+            "emotion": 0.7,
+            "interests": 1.0,
+            "triggers": 1.0,
+            "style": 1.0,
+            "question_boost": 1.8,
+            "controversy_boost": 1.0
+          }
+        },
+        {
+          "segment": "Retired Journalist",
+          "engagement_score": 0.10919999999999999,
+          "match_factors": {
+            "content": 1.2,
+            "emotion": 0.7,
+            "interests": 1.0,
+            "triggers": 1.0,
+            "style": 1.0,
+            "question_boost": 1.8,
+            "controversy_boost": 1.0
+          }
+        },
+        {
+          "segment": "Data Journalist",
+          "engagement_score": 0.09555,
+          "match_factors": {
+            "content": 1.2,
+            "emotion": 0.7,
+            "interests": 1.0,
+            "triggers": 1.0,
+            "style": 1.0,
+            "question_boost": 1.8,
+            "controversy_boost": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "timestamp": "2025-08-06T19:36:12.184679",
+      "tweet_text": "Check out my new blog post about financial freedom \ud83d\udcb0",
+      "predicted": {
+        "likes": 563.3587761799973,
+        "retweets": 283.93717690799923,
+        "replies": 154.9467294000021
+      },
+      "actual": {
+        "likes": 150,
+        "retweets": 30,
+        "replies": 12
+      },
+      "engaged_personas_count": 20,
+      "top_segments": [
+        {
+          "segment": "eSports Athlete (Pro Gamer)",
+          "engagement_score": 0.10919999999999999,
+          "match_factors": {
+            "content": 1.2,
+            "emotion": 0.7,
+            "interests": 1.0,
+            "triggers": 1.0,
+            "style": 1.0,
+            "question_boost": 1.0,
+            "controversy_boost": 1.0
+          }
+        },
+        {
+          "segment": "Politician",
+          "engagement_score": 0.10919999999999999,
+          "match_factors": {
+            "content": 1.2,
+            "emotion": 0.7,
+            "interests": 1.0,
+            "triggers": 1.0,
+            "style": 1.0,
+            "question_boost": 1.0,
+            "controversy_boost": 1.0
+          }
+        },
+        {
+          "segment": "Retired Journalist",
+          "engagement_score": 0.10919999999999999,
+          "match_factors": {
+            "content": 1.2,
+            "emotion": 0.7,
+            "interests": 1.0,
+            "triggers": 1.0,
+            "style": 1.0,
+            "question_boost": 1.0,
+            "controversy_boost": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "timestamp": "2025-08-06T19:36:16.587483",
+      "tweet_text": "Why does nobody talk about the mental health crisis in tech? \ud83e\udde0",
+      "predicted": {
+        "likes": 648.2912164600023,
+        "retweets": 328.7965050760003,
+        "replies": 278.9041129199964
+      },
+      "actual": {
+        "likes": 380,
+        "retweets": 120,
+        "replies": 67
+      },
+      "engaged_personas_count": 20,
+      "top_segments": [
+        {
+          "segment": "eSports Athlete (Pro Gamer)",
+          "engagement_score": 0.12739999999999999,
+          "match_factors": {
+            "content": 1.4,
+            "emotion": 0.7,
+            "interests": 1.0,
+            "triggers": 1.0,
+            "style": 1.0,
+            "question_boost": 1.8,
+            "controversy_boost": 1.0
+          }
+        },
+        {
+          "segment": "Streamer",
+          "engagement_score": 0.12739999999999999,
+          "match_factors": {
+            "content": 1.4,
+            "emotion": 0.7,
+            "interests": 1.0,
+            "triggers": 1.0,
+            "style": 1.0,
+            "question_boost": 1.8,
+            "controversy_boost": 1.0
+          }
+        },
+        {
+          "segment": "Influencer / Gamer",
+          "engagement_score": 0.12739999999999999,
+          "match_factors": {
+            "content": 1.4,
+            "emotion": 0.7,
+            "interests": 1.0,
+            "triggers": 1.0,
+            "style": 1.0,
+            "question_boost": 1.8,
+            "controversy_boost": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "timestamp": "2025-08-06T19:36:21.662934",
+      "tweet_text": "Made $10k this month with my side hustle! Here's how... \ud83d\ude80",
+      "predicted": {
+        "likes": 522.2493117799946,
+        "retweets": 263.47323906799625,
+        "replies": 278.9041129199964
+      },
+      "actual": {
+        "likes": 890,
+        "retweets": 245,
+        "replies": 89
+      },
+      "engaged_personas_count": 20,
+      "top_segments": [
+        {
+          "segment": "Retired Journalist",
+          "engagement_score": 0.12739999999999999,
+          "match_factors": {
+            "content": 1.4,
+            "emotion": 0.7,
+            "interests": 1.0,
+            "triggers": 1.0,
+            "style": 1.0,
+            "question_boost": 1.8,
+            "controversy_boost": 1.0
+          }
+        },
+        {
+          "segment": "Politician",
+          "engagement_score": 0.10919999999999999,
+          "match_factors": {
+            "content": 1.2,
+            "emotion": 0.7,
+            "interests": 1.0,
+            "triggers": 1.0,
+            "style": 1.0,
+            "question_boost": 1.8,
+            "controversy_boost": 1.0
+          }
+        },
+        {
+          "segment": "Professor of Computer Science",
+          "engagement_score": 0.10919999999999999,
+          "match_factors": {
+            "content": 1.2,
+            "emotion": 0.7,
+            "interests": 1.0,
+            "triggers": 1.0,
+            "style": 1.0,
+            "question_boost": 1.8,
+            "controversy_boost": 1.0
+          }
+        }
+      ]
+    }
+  ],
+  "total_tests": 6
+}
