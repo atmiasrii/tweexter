@@ -99,6 +99,13 @@ except ImportError:
 sia = SentimentIntensityAnalyzer()
 
 # Optional: Hugging Face (free, local)
+
+# Use LOCAL_MODEL_DIRS from api.py if available
+try:
+    from api import LOCAL_MODEL_DIRS
+except ImportError:
+    LOCAL_MODEL_DIRS = {}
+
 HF_MODEL_ID = "cardiffnlp/twitter-roberta-base-sentiment-latest"
 _tokenizer = None
 _hf_model = None
@@ -119,13 +126,13 @@ def _lazy_load_hf():
         # Suppress all transformers warnings
         warnings.filterwarnings("ignore")
         os.environ["TRANSFORMERS_VERBOSITY"] = "error"
-        
+        path = LOCAL_MODEL_DIRS.get(HF_MODEL_ID, HF_MODEL_ID)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             from transformers import AutoTokenizer, AutoModelForSequenceClassification
             import torch
-            _tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_ID, verbose=False)
-            _hf_model = AutoModelForSequenceClassification.from_pretrained(HF_MODEL_ID, verbose=False)
+            _tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True, verbose=False)
+            _hf_model = AutoModelForSequenceClassification.from_pretrained(path, local_files_only=True, verbose=False)
             _hf_model.eval()
 
 def _sentiment_compound(text: str) -> float:

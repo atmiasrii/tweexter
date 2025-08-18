@@ -1,20 +1,40 @@
-# api.py
-# FastAPI wrapper for Tweexter predictions with follower-aware scaling.
+def preload_hf_models():
+    auth = {"token": HF_TOKEN} if HF_TOKEN else {}
+    for repo in PRELOAD_MODELS:
+        local_dir = snapshot_download(repo_id=repo, local_dir_use_symlinks=False, **auth)
+        LOCAL_MODEL_DIRS[repo] = local_dir
 
-import os           # NEW
-import csv          # NEW
-import time         # NEW
-from datetime import datetime  # NEW
-import re  # NEW
+
+# ================= IMPORTS (moved to top) =================
+import os
+import csv
+import time
+from datetime import datetime
+import re
 import warnings
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+from huggingface_hub import snapshot_download
 from fastapi import FastAPI, HTTPException, Form
 from pydantic import BaseModel, Field, validator
 from starlette.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
+from pathlib import Path
+
+
+# ================= END IMPORTS =================
+
+HF_TOKEN = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+
+PRELOAD_MODELS = [
+    "cardiffnlp/twitter-roberta-base-sentiment-latest",
+    # add any others used by features/emotions, e.g.:
+    # "j-hartmann/emotion-english-distilroberta-base",
+    # "SamLowe/roberta-base-go_emotions",
+]
+
+LOCAL_MODEL_DIRS = {}
 
 # --- timing log setup ---
-from pathlib import Path
 LOG_PATH = Path("predict_timing.csv")
 
 def _log_timing_row(row: dict) -> None:
@@ -63,6 +83,16 @@ from final import (
 )
 
 app = FastAPI(title="Tweexter API", version="1.0.0")
+
+# Preload models on startup
+@app.on_event("startup")
+def _warm():
+    preload_hf_models()
+    # Optionally: run one dry prediction to JIT-load everything
+    try:
+        predict_blended("warmup", followers=100)
+    except Exception:
+        pass
 
 # CORS (wide open for local dev)
 app.add_middleware(
@@ -392,9 +422,10 @@ def _append_timing_csv(row: dict) -> None:
 def _compute(text: str, followers: int, return_details: bool) -> PredictResponse:
     t_route0 = time.perf_counter()  # NEW
 
-    override_w = pick_blend_weights(followers)
+    # Always use blend mode: combine ML and persona_engine (Elo) scores
+    override_w = pick_blend_weights(followers)  # This sets blend weights (e.g., 0.7 ML, 0.3 Elo)
     t_pred0 = time.perf_counter()  # NEW
-    base = predict_blended(text, override_w)
+    base = predict_blended(text, override_w)  # predict_blended already blends ML and persona_engine
     t_pred_ms = int((time.perf_counter() - t_pred0) * 1000)  # total predict_blended wall time (backup)
     blended = base.get("blended", {"likes": 0.0, "retweets": 0.0, "replies": 0.0})
 
@@ -574,6 +605,7 @@ def _compute(text: str, followers: int, return_details: bool) -> PredictResponse
             "models_used": base.get("models_used", {}),
             "ml_raw": base.get("ml", {}),
             "persona_raw": base.get("persona", {}),
+            "blend_weights": override_w,  # Explicitly show blend weights used
             "blended_before_scaling": blended,
             "scaling_factors": scales,
             "follower_baselines": baselines_for(followers, cfg),
@@ -601,9 +633,11 @@ def _compute(text: str, followers: int, return_details: bool) -> PredictResponse
 
 # ---------- Routes ----------
 
+
+# Real health endpoint
 @app.get("/healthz")
-def health() -> Dict[str, str]:
-    return {"status": "ok"}
+def healthz():
+    return {"ok": True}
 
 @app.get("/")
 def root() -> Dict[str, str]:

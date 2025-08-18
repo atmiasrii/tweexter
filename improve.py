@@ -1,3 +1,117 @@
+from __future__ import annotations
+CHAR_LIMIT = 280
+# === Minimal Post-Processing (keep-only) ===
+class MiniPost:
+    @staticmethod
+    def normalize_spaces(s: str) -> str:
+        s = re.sub(r'[ \t]+', ' ', s)
+        s = re.sub(r'\n{3,}', '\n\n', s)
+        return s.strip()
+
+    @staticmethod
+    def sanitize_basic(text: str, ent: "Entities") -> str:
+        """Reinsert any dropped original entities without inventing new ones."""
+        out = (text or "").strip()
+        # ensure original mentions at the front if missing
+        for m in getattr(ent, "mentions", []) or []:
+            if m and m not in out:
+                out = f"{m} {out}"
+        # ensure original links present (append once)
+        for link in getattr(ent, "links", []) or []:
+            if link and link not in out:
+                out = f"{out} {link}"
+        # ensure original hashtags present (append once)
+        for h in getattr(ent, "hashtags", []) or []:
+            if h and h not in out and len(out) + len(h) + 1 <= CHAR_LIMIT:
+                out = f"{out} {h}"
+        return out
+
+    @staticmethod
+    def clamp_hashtags(text: str, ent: "Entities", max_new: int) -> str:
+        """Keep all original hashtags; allow at most `max_new` new ones (drop the rest)."""
+        orig = {h.lower() for h in getattr(ent, "hashtags", []) or []}
+        toks = text.split()
+        kept, new_seen = [], set()
+        allowed_new = max(0, int(max_new))
+        for t in toks:
+            if t.startswith("#"):
+                low = t.lower()
+                if low in orig:
+                    kept.append(t)
+                else:
+                    if len(new_seen) < allowed_new and low not in new_seen:
+                        kept.append(t); new_seen.add(low)
+                    # else drop extra new tag
+            else:
+                kept.append(t)
+        return " ".join(kept).strip()
+
+    @staticmethod
+    def limit_emojis(text: str, max_emojis: int) -> str:
+        if count_emojis(text) <= max_emojis:
+            return text
+        keep = max_emojis
+        def _strip_extra(m):
+            nonlocal keep
+            if keep > 0:
+                keep -= 1
+                return m.group(0)
+            return ""
+        return EMOJI_RE.sub(_strip_extra, text)
+
+    @staticmethod
+    def ensure_char_limit(text: str, limit: int = CHAR_LIMIT) -> str:
+        return _smart_truncate(text, limit=limit)
+
+    @staticmethod
+    def dedupe(texts: List[str]) -> List[str]:
+        seen, out = set(), []
+        for t in texts:
+            key = re.sub(r'\W+', '', (t or "").lower())
+            if key in seen: 
+                continue
+            seen.add(key); out.append(t)
+        return out
+
+    @staticmethod
+    def batch(
+        *,
+        original: str,
+        candidates: List[str],
+        entities: "Entities",
+        max_new_hashtags: int,
+        max_emojis: int,
+        limit: int
+    ) -> List[str]:
+        """Minimal, deterministic clean-up with only hard constraints."""
+        out = []
+        for c in candidates:
+            if not c or not c.strip():
+                continue
+            s = _strip_quote_bullets(c)
+            s = MiniPost.sanitize_basic(s, entities)
+
+            # Reject if it introduces new links/mentions/numeric claims/years
+            if not _no_new_claim_risk(original, s):
+                continue
+
+            s = MiniPost.clamp_hashtags(s, entities, max_new_hashtags)
+            s = MiniPost.limit_emojis(s, max_emojis)
+            s = MiniPost.ensure_char_limit(s, limit)
+            s = MiniPost.normalize_spaces(s)
+            out.append(s)
+
+        out = MiniPost.dedupe(out)
+
+        # Always return at least one candidate
+        if not out:
+            fallback = MiniPost.sanitize_basic(original, entities)
+            fallback = MiniPost.clamp_hashtags(fallback, entities, max_new_hashtags)
+            fallback = MiniPost.limit_emojis(fallback, max_emojis)
+            fallback = MiniPost.ensure_char_limit(fallback, limit)
+            out = [MiniPost.normalize_spaces(fallback)]
+
+        return out
 # improve.py — skeleton (v0)
 # Purpose: take a tweet, generate 5–7 improved variants with Gemini, score them
 # with your prediction stack/personas, and return the best + context.
@@ -6,14 +120,13 @@
 # export SCORING_MODE=blend
 # export NUM_VARIANTS=7
 # export PERSONA_SAMPLE_SIZE=1200
-# export GEMINI_MODEL="models/gemini-1.5-pro"
+# export GEMINI_MODEL="models/gemini-2.5-flash"
 # export TEMPERATURE=0.9
 # export MAX_NEW_HASHTAGS=1
 # export MAX_EMOJIS=2
 # export ALLOW_CTA=true
 
-from __future__ import annotations
-# --- Consolidated imports ---
+ # --- Consolidated imports ---
 import re, unicodedata
 import os
 import json
@@ -27,12 +140,59 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 from types import SimpleNamespace
 from functools import lru_cache
 from datetime import datetime, timezone
+import threading
+# --- ADD: scorer warmup utility ---
+def wait_for_scorer_ready(timeout=15, interval=0.5, verbose=True):
+    """
+    Ping the scorer API until it responds, or until timeout (in seconds).
+    Returns True if ready, False if not.
+    """
+    if not SCORER_URL:
+        return False
+    import time, requests, urllib.parse
+    base = SCORER_URL
+    # strip /predict if present
+    if base.endswith("/predict"):
+        base = base.rsplit("/predict", 1)[0]
+    url = urllib.parse.urljoin(base + "/", "healthz")
+    deadline = time.time() + timeout
+    last_err = None
+    while time.time() < deadline:
+        try:
+            r = requests.get(url, timeout=1.5)
+            if r.status_code == 200:
+                if verbose: print(f"[improve.py] Scorer API ready at {url}")
+                return True
+        except Exception as e:
+            last_err = e
+            if verbose: print(f"[improve.py] Waiting for scorer API at {url}... ({e})")
+        time.sleep(interval)
+    if verbose: print(f"[improve.py] Scorer API not ready after {timeout}s: {last_err}")
+    return False
 
 # optional HTTP scorer settings (useful when running a separate scorer service)
-import requests  # <-- add this
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+
+# Define retries for HTTPAdapter
+retries = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+)
+# Increase HTTPAdapter pool size to avoid connection pool full errors
+adapter = HTTPAdapter(max_retries=retries, pool_connections=100, pool_maxsize=100)
+_SESSION = requests.Session()
+_SESSION.mount("http://", adapter)
+_SESSION.mount("https://", adapter)
 
 SCORER_URL = os.getenv("SCORER_URL")  # e.g., http://localhost:8000/predict
-SCORER_TIMEOUT = float(os.getenv("SCORER_TIMEOUT", "3"))
+SCORER_TIMEOUT = float(os.getenv("SCORER_TIMEOUT", "8"))
 
 # Optional ELO endpoint (only if you have it)
 SCORER_ELO_URL = os.getenv("SCORER_ELO_URL")  # e.g., http://localhost:8000/elo
@@ -54,7 +214,7 @@ def _env_int(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class Settings:
-    NUM_VARIANTS: int = 6                      # 5–7 recommended
+    NUM_VARIANTS: int = 30                     # Default is now 30
     SCORING_MODE: str = "blend"                # "ml" | "elo" | "blend"
     ALPHA_RETWEETS: float = 2.0
     BETA_REPLIES: float = 1.0
@@ -63,10 +223,11 @@ class Settings:
     ALLOW_CTA: bool = True
     PERSONA_SAMPLE_SIZE: int = 1000            # if sub-sampling for Elo
     TRENDING_HASHTAGS_ENABLED: bool = True
-    GEMINI_MODEL: str = "models/gemini-1.5-pro"
+    GEMINI_MODEL: str = "models/gemini-2.5-flash"  # Gemini 2.5 Flash
     TEMPERATURE: float = 0.85
     TIMEOUT: int = 20                          # seconds
     RETRIES: int = 2
+    DISABLE_ENGAGEMENT_MECHANICS: bool = True
 
 def load_settings(path: str = "config.json") -> Settings:
     # 1) defaults
@@ -96,15 +257,59 @@ def load_settings(path: str = "config.json") -> Settings:
     base["TEMPERATURE"]             = _env_float("TEMPERATURE", base["TEMPERATURE"])
     base["TIMEOUT"]                 = _env_int("TIMEOUT", base["TIMEOUT"])
     base["RETRIES"]                 = _env_int("RETRIES", base["RETRIES"])
+    base["DISABLE_ENGAGEMENT_MECHANICS"] = _env_bool("DISABLE_ENGAGEMENT_MECHANICS", base.get("DISABLE_ENGAGEMENT_MECHANICS", True))
 
     return Settings(**base)
+
 
 # single global settings object
 SETTINGS = load_settings()
 
+
+# --- Make HF token and persistent cache available to huggingface_hub / transformers ---
+HF_TOKEN = os.getenv("HF_TOKEN")
+if not HF_TOKEN:
+    try:
+        with open("config.json") as f:
+            HF_TOKEN = (json.load(f) or {}).get("HF_TOKEN")
+    except FileNotFoundError:
+        HF_TOKEN = None
+if HF_TOKEN:
+    os.environ["HF_TOKEN"] = HF_TOKEN  # huggingface_hub reads this env var
+    os.environ["HUGGINGFACE_HUB_TOKEN"] = HF_TOKEN
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  # faster downloads
+# Set persistent cache directory early (before any model loading)
+HF_CACHE_DIR = os.path.abspath(os.path.join(os.getcwd(), ".hf_cache"))
+os.environ["HF_HOME"] = HF_CACHE_DIR
+
+# Optional: create the cache directory if it doesn't exist
+import os
+if not os.path.exists(HF_CACHE_DIR):
+    os.makedirs(HF_CACHE_DIR, exist_ok=True)
+
+# --- Utility: Pre-download all required HuggingFace models (run once if needed) ---
+def predownload_hf_models(model_list):
+    """Pre-download all HuggingFace models to the persistent cache."""
+    from huggingface_hub import snapshot_download
+    auth = {"token": HF_TOKEN} if HF_TOKEN else {}
+    for repo in model_list:
+        print(f"Downloading {repo} ...")
+        snapshot_download(repo_id=repo, local_dir_use_symlinks=False, **auth)
+    print("All models downloaded and cached in:", HF_CACHE_DIR)
+
+# PRELOAD_MODELS = [
+#     "cardiffnlp/twitter-roberta-base-sentiment-latest",
+#     # Add any others you use
+# ]
+# predownload_hf_models(PRELOAD_MODELS)
+
+
 # --- WIRE SETTINGS INTO EXISTING KNOBS ---
-NUM_VARIANTS_DEFAULT   = SETTINGS.NUM_VARIANTS
-SCORING_MODE_DEFAULT   = SETTINGS.SCORING_MODE         # "ml" | "elo" | "blend"
+NUM_VARIANTS_DEFAULT   = SETTINGS.NUM_VARIANTS  # Will be 30 by default
+# FORCE BLEND MODE ALWAYS
+SCORING_MODE_DEFAULT   = "blend"  # Always use blend mode, ignore config/env
+BLEND_W_ML  = 0.70
+BLEND_W_ELO = 0.30
 ALPHA_RETWEETS         = SETTINGS.ALPHA_RETWEETS
 BETA_REPLIES           = SETTINGS.BETA_REPLIES
 MAX_NEW_HASHTAGS       = SETTINGS.MAX_NEW_HASHTAGS
@@ -407,8 +612,17 @@ def _ensure_entities(analysis, text: str):
     # If you don't have an Entities dataclass, swap this for a dict with same fields.
     return Entities(links=links, mentions=mentions, hashtags=hashtags)
 
+def _strip_quote_bullets(s: str) -> str:
+    lines = s.splitlines()
+    cleaned = []
+    for ln in lines:
+        ln = re.sub(r'^\s*(>{1,3}\s*|\-\s+|\*\s+|\d+\.\s+)', '', ln)  # >, >>, -, *, 1.
+        cleaned.append(ln.strip())
+    return ' '.join(l for l in cleaned if l)
+
 def precheck_and_parse(tweet_text: str):
     t = (tweet_text or "").strip()
+    t = _strip_quote_bullets(t)
     if len(t) < 8:
         raise ValueError("tweet_too_short")
     lang = _detect_language_heuristic(t)
@@ -417,29 +631,27 @@ def precheck_and_parse(tweet_text: str):
     analysis.entities = _ensure_entities(analysis, t)
     return t, analysis
 
-# --- Real scoring stack selection (HTTP-first) ---
+
+# --- Real scoring stack selection (HTTP-first, then local persona_engine) ---
 _real_run_elo_tournament = None
+ENGINE = None
+
 if SCORER_URL:
     _SCORING_STACK_AVAILABLE = True
     log.info("Using HTTP scorer at %s", SCORER_URL)
 else:
     try:
-        from my_model import EnhancedPersonaEngine, run_elo_tournament as _real_run_elo_tournament
+        from persona_engine import EnhancedPersonaEngine, run_elo_tournament as _real_run_elo_tournament
+        ENGINE = EnhancedPersonaEngine()  # or EnhancedPersonaEngine.from_config("config.json") if you have that
         _SCORING_STACK_AVAILABLE = True
-        log.info("Using local my_model scorer.")
+        log.info("Using local persona_engine scorer.")
     except Exception as e:
         _SCORING_STACK_AVAILABLE = False
-        log.warning("Scoring stack not imported yet. Using fallback pass-through scorer. (%s)", e)
+        log.warning("persona_engine not available; using fallback heuristic scorer. (%s)", e)
 
-# Helper function for loading personas
-def load_personas(file_path: str) -> List[Dict]:
-    """Load personas from JSON file, return empty list if not found."""
-    try:
-        with open(file_path, 'r') as f:
-            return json.load(f)
-    except Exception as e:
-        log.debug("Could not load personas from %s: %s", file_path, e)
-        return []
+
+# Use persona_engine's loader to ensure correct Persona structure
+from persona_engine import load_personas
 
 # Wrapper that calls the real Elo if present, else falls back
 def run_elo_tournament(texts: List[str], personas: List[Dict]) -> List[Dict]:
@@ -546,7 +758,7 @@ class TweetAnalyzer:
 # --- REPLACE: PromptBuilder.build to use a single rich, numbered-output prompt ---
 class PromptBuilder:
     @staticmethod
-    def build(text: str, analysis, n: int = 6) -> str:
+    def build(text: str, analysis, n: int = 30) -> str:
         kind = getattr(analysis, "tweet_type", None) or "general"
         cfg  = get_style_constraints(kind)
         ent  = analysis.entities
@@ -559,33 +771,28 @@ class PromptBuilder:
         mentions = getattr(ent, "mentions", []) or []
         keep_tags = getattr(ent, "hashtags", []) or []
 
+
+        # --- Dynamic roles and length targets ---
+        roles_bank = [
+            "hook","question_specific","benefit_first","curiosity_gap","contrast","editor_choice",
+            "myth_buster","imperative","proof","listicle","negative_hook","question_specific_2"
+        ]
+        variant_roles = {f"v{i+1}": roles_bank[i] for i in range(min(n, len(roles_bank)))}
+
+        def _length_targets_for(n: int):
+            m = {f"v{i}": "~100" for i in range(1, n+1)}
+            if n >= 2: m["v2"] = "<=60"
+            if n >= 3: m["v3"] = "200-240"
+            return m
+
         # === Section A: Content + Length Rules ===
         content_rules = {
-            # Lead with the best bit
             "lead_with_best_bit": True,   # Start with the stat, claim, or payoff
-
-            # Hit the sweet spot length
             "sweet_spot_length_hint_chars": "~100",
-            "length_targets_per_variant": {
-                # ensure variety across the batch
-                "v1": "~100",
-                "v2": "<=60",     # ultra-short
-                "v3": "200-240",  # longer, still crisp
-                "v4": "~100",
-                "v5": "~100",
-                "v6": "~100"
-            },
-
-            # One idea per tweet
+            "length_targets_per_variant": _length_targets_for(n),
             "one_idea_only": True,  # “no multi-ideas; split or pick the strongest.”
-
-            # Keep substance, trim fluff
             "prefer_concrete_over_filler": True,  # prefer concrete nouns/verbs over filler
-
-            # Avoid over-linking
             "require_takeaway_before_link": True, # include at least one concrete takeaway BEFORE any link
-
-            # End strong
             "end_strong": True  # end with a punchy question, payoff, or crisp phrase
         }
 
@@ -731,6 +938,17 @@ class PromptBuilder:
         )
 
         # Gemini receives this JSON string as the prompt
+        # --- FIX: convert any set in payload to list for JSON serialization ---
+        def convert_sets(obj):
+            if isinstance(obj, dict):
+                return {k: convert_sets(v) for k, v in obj.items()}
+            elif isinstance(obj, set):
+                return list(obj)
+            elif isinstance(obj, list):
+                return [convert_sets(i) for i in obj]
+            else:
+                return obj
+        payload = convert_sets(payload)
         return json.dumps(payload, ensure_ascii=False)
 
 ## =========================
@@ -739,9 +957,9 @@ class PromptBuilder:
 class GeminiClient:
     def __init__(self, api_key: str, model: str, temperature: float, timeout: int = 20, retries: int = 2):
         try:
-            import google.generativeai as genai  # type: ignore
+            import google.generativeai as genai
         except ImportError:
-            genai = None
+            raise RuntimeError("google-generativeai not installed. Run: pip install google-generativeai")
         self._genai = genai
         self.api_key = api_key
         self.model_name = model
@@ -752,39 +970,59 @@ class GeminiClient:
         if not self.api_key:
             raise RuntimeError("GEMINI_API_KEY not set")
 
-        self._genai.configure(api_key=self.api_key)
-        self._model = self._genai.GenerativeModel(self.model_name)
+        genai.configure(api_key=self.api_key)
+        self._model = genai.GenerativeModel(self.model_name)
 
     def generate_variants(self, prompt: str, n: int, temperature: Optional[float] = None) -> str:
-        # We return a RAW string; caller will parse numbered list.
+        """
+        Generate variants using Gemini. Robustly handle finish_reason 2 (model stopped), empty, or malformed responses.
+        Log finish_reason and error details. Fallback to deterministic variants if no valid output is found.
+        """
+        import logging
         actual_temp = temperature if temperature is not None else self.temperature
-
-        # Basic retry loop
         last_err = None
-        for _ in range(max(1, self.retries)):
+        max_output_tokens = min(4096, 128 + n * 80)
+        for attempt in range(max(1, self.retries)):
             try:
                 resp = self._model.generate_content(
                     prompt,
                     generation_config=self._genai.GenerationConfig(
                         temperature=actual_temp,
-                        max_output_tokens=1024,
+                        max_output_tokens=max_output_tokens,
                     )
                 )
-                # Some SDK versions use .text; others .candidates[0].content.parts
+                # Prefer .text if present and non-empty
                 if hasattr(resp, "text") and resp.text:
                     return resp.text
-                # Fallback extraction
-                if getattr(resp, "candidates", None):
-                    parts = []
-                    for p in getattr(resp.candidates[0], "content", {}).parts or []:
-                        if getattr(p, "text", None):
-                            parts.append(p.text)
-                    if parts:
-                        return "\n".join(parts)
-                raise RuntimeError("Empty Gemini response")
+                # Fallback: try to extract from candidates
+                candidates = getattr(resp, "candidates", None)
+                if candidates and isinstance(candidates, list):
+                    for cand in candidates:
+                        finish_reason = getattr(cand, "finish_reason", None)
+                        # finish_reason 2 = STOP, 1 = SAFETY, 0 = FINISHED
+                        if finish_reason not in (0, None):
+                            logging.warning(f"[Gemini] LLM generation finish_reason={finish_reason} (not finished). Candidate: {getattr(cand, 'content', None)}")
+                        content = getattr(cand, "content", None)
+                        # Try .parts (list of Part objects with .text)
+                        if content and hasattr(content, "parts"):
+                            parts = [getattr(p, "text", "") for p in content.parts if getattr(p, "text", None)]
+                            if parts:
+                                return "\n".join(parts)
+                        # Try .text directly
+                        if hasattr(content, "text") and content.text:
+                            return content.text
+                    # If all candidates exhausted, log and break
+                    logging.error(f"[Gemini] No valid candidates in LLM response. Candidates: {candidates}")
+                else:
+                    logging.error(f"[Gemini] LLM response missing candidates: {resp}")
+                # If we reach here, no valid output found
+                raise RuntimeError("Empty or invalid Gemini response (no usable text/candidates)")
             except Exception as e:
                 last_err = e
+                logging.warning(f"[Gemini] LLM generation attempt {attempt+1} failed: {e}")
                 time.sleep(0.4)
+        # All retries failed; log and raise
+        logging.error(f"[Gemini] All LLM generation attempts failed. Last error: {last_err}")
         raise last_err
 
 
@@ -794,7 +1032,10 @@ class GeminiClient:
 class PostProcessor:
     @staticmethod
     def normalize_spaces(s: str) -> str:
-        return re.sub(r'\s+', ' ', s).strip()
+        # Collapse spaces/tabs, but keep bullets/newlines
+        s = re.sub(r'[ \t]+', ' ', s)
+        s = re.sub(r'\n{3,}', '\n\n', s)
+        return s.strip()
 
     @staticmethod
     def limit_emojis(text: str, max_emojis: int) -> str:
@@ -868,6 +1109,10 @@ class PostProcessor:
             cut = out[:hard_char_cap]
             punct = max(cut.rfind('.'), cut.rfind('!'), cut.rfind('?'), cut.rfind(','), cut.rfind(' ')) 
             out = cut if punct < 40 else cut[:punct].rstrip()  # avoid chopping too early
+
+        # --- Tiny post-process scrub for bracketed placeholders and orphaned 'I'm aiming for' ---
+        out = re.sub(r'\[[^\[\]\n]{1,40}\]', '', out)  # drop bracketed placeholders
+        out = re.sub(r"\bI'?m\s+aiming\s+for\s*[—–-]?\s*$", "", out, flags=re.I)  # remove orphaned clause
 
         return PostProcessor.normalize_spaces(out)
 
@@ -943,8 +1188,25 @@ class PostProcessor:
         # ensure some pattern diversity (question, stat, imperative). Minimal for skeleton.
         return texts  # No generic question injection; rely on ensure_engagement_mechanics()
 
+
 # --- ADD: Ensure Step B roles exist across the set ---
+# --- Tiny cleanup: dedupe links ---
+def _dedupe_links(text: str) -> str:
+    out, seen = [], set()
+    for tok in text.split():
+        if LINK_RE.match(tok):
+            if tok in seen:
+                continue
+            seen.add(tok)
+        out.append(tok)
+    return " ".join(out)
+
 def ensure_engagement_mechanics(variants: List[str], original: str, ent: Entities) -> List[str]:
+    import re
+    # Don’t auto-hook list/how-to posts
+    if '\n' in original or re.search(r'(?i)\bhow to\b', original):
+        return variants  # skip hook/question/contrast injection for checklists
+
     out = list(variants)
 
     have_hook      = any(is_hook_variant(v)               for v in out)
@@ -959,9 +1221,10 @@ def ensure_engagement_mechanics(variants: List[str], original: str, ent: Entitie
         candidate = PostProcessor.ensure_takeaway_before_link(original, candidate)
         candidate = reinsert_missing_entities(candidate, ent)
         candidate = PostProcessor.enforce_limits(candidate, ent, MAX_NEW_HASHTAGS, MAX_EMOJIS_GENERAL, CHAR_LIMIT)
+        candidate = _dedupe_links(candidate)
         out[idx] = candidate
 
-    if not out: 
+    if not out:
         return out
 
     shortest_i = min(range(len(out)), key=lambda i: len(out[i]))
@@ -971,11 +1234,14 @@ def ensure_engagement_mechanics(variants: List[str], original: str, ent: Entitie
         safe_prepend(shortest_i, "Reminder:")
 
     if not have_question:
-        topic = ent.hashtags[0] if ent.hashtags else (ent.mentions[0] if ent.mentions else (KEY_NUMBER_RE.search(original).group(0) if KEY_NUMBER_RE.search(original) else "this"))
+        # Build a sane question topic
+        m_pair = re.search(r'\b\d+\s+\w+', original)
+        topic = (ent.hashtags[0] if ent.hashtags else ent.mentions[0] if ent.mentions else (m_pair.group(0) if m_pair else "this process"))
         q = f"What would you change first about {topic}?"
         s = out[0]
         cand = (s.rstrip(".! ") + " " + q).strip()
         cand = PostProcessor.enforce_limits(cand, ent, MAX_NEW_HASHTAGS, MAX_EMOJIS_GENERAL, CHAR_LIMIT)
+        cand = _dedupe_links(cand)
         out[0] = cand
 
     if not have_benefit:
@@ -989,27 +1255,232 @@ def ensure_engagement_mechanics(variants: List[str], original: str, ent: Entitie
 
     return out
 
+# --- Type-specific style enforcement + one-idea validator --------------------
+# Put these near your other helpers (e.g., after ensure_engagement_mechanics)
+
+NEWS_ALLOWED_PREFIXES = ("New:", "Data:", "Update:", "Fact:", "Breaking:")
+BENEFIT_VERBS = {
+    "save","cut","boost","increase","reduce","improve","grow","speed","ship","get","win"
+}
+CTA_RE = re.compile(
+    r'\b(join|sign\s*up|get\s*started|try|download|subscribe|enroll|book|apply|start\s*(free|now)|buy|shop)\b',
+    re.IGNORECASE
+)
+HEDGE_RE = re.compile(
+    r'\b(kinda|sort of|maybe|perhaps|I think|I feel|seems|might|could|probably|IMO|IMHO)\b',
+    re.IGNORECASE
+)
+WEAK_OPENERS_RE = re.compile(
+    r'^\s*(today|some|this|there|here|just|FYI|announcing|sharing|random)\b[:,\s-]*',
+    re.IGNORECASE
+)
+
+def _first_sentence_chunks(s: str) -> Tuple[str, str]:
+    """Return (first_sentence, rest) using light punctuation split."""
+    parts = re.split(r'(?<=[.!?])\s+', s.strip(), maxsplit=1)
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[1]
+
+def _starts_with_stat_or_prefix(s: str) -> bool:
+    t = s.strip()
+    if any(t.startswith(p) for p in NEWS_ALLOWED_PREFIXES): 
+        return True
+    if KEY_NUMBER_RE.match(t) or YEAR_RE.match(t): 
+        return True
+    return False
+
+def _move_first_numeric_clause_front(s: str) -> str:
+    """If a number/year exists later, bring that sentence to the front."""
+    sentences = re.split(r'(?<=[.!?])\s+', s.strip())
+    idx = None
+    for i, sen in enumerate(sentences):
+        if KEY_NUMBER_RE.search(sen) or YEAR_RE.search(sen):
+            idx = i; break
+    if idx is None or idx == 0: 
+        return s
+    ordered = [sentences[idx]] + sentences[:idx] + sentences[idx+1:]
+    return PostProcessor.normalize_spaces(" ".join(ordered))
+
+def _cap_questions(text: str, max_q: int) -> str:
+    """Keep at most max_q question marks; convert extras to periods."""
+    if max_q < 0: 
+        return text
+    out, seen = [], 0
+    for ch in text:
+        if ch == "?":
+            if seen < max_q:
+                out.append("?"); seen += 1
+            else:
+                out.append(".")
+        else:
+            out.append(ch)
+    return PostProcessor.normalize_spaces("".join(out))
+
+def _strip_hedging(text: str) -> str:
+    return PostProcessor.normalize_spaces(HEDGE_RE.sub("", text))
+
+def one_idea_only_ok(text: str) -> bool:
+    """
+    Reject variants that cram multiple ideas.
+    Heuristics:
+      - >2 sentences OR
+      - Too many heavy separators (; • — /) OR
+      - 2+ coordinating conjunctions (and/but/while/yet/whereas)
+    """
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    if len([s for s in sentences if s]) > 2:
+        return False
+    seps = len(re.findall(r'[;/•]|—|–| / ', text))
+    if seps >= 2:
+        return False
+    conj = len(re.findall(r'\b(and|but|while|yet|whereas)\b', text, flags=re.IGNORECASE))
+    return conj < 3
+
+def compress_to_one_idea(text: str) -> str:
+    """Keep just the first strong clause."""
+    first, _rest = _first_sentence_chunks(text)
+    # Also cut at long dashes/semicolons if present
+    first = re.split(r'[;—–/•]', first)[0]
+    return PostProcessor.smart_truncate(first, limit=CHAR_LIMIT)
+
+def enforce_news_style(original: str, text: str) -> str:
+    # No added questions if original had none
+    if "?" not in original and "?" in text:
+        text = text.replace("?", ".")
+    # Lead with stat/fact/prefix
+    if not _starts_with_stat_or_prefix(text):
+        text = _move_first_numeric_clause_front(text)
+        if not _starts_with_stat_or_prefix(text):
+            text = f"Update: {text}"
+    # Authoritative: remove hedging, avoid exclamations spam
+    text = _strip_hedging(text)
+    text = re.sub(r'!{2,}', '!', text)
+    return text
+
+def enforce_personal_style(original: str, text: str) -> str:
+    # Keep max one question, but don't add first-person prefixes
+    text = _cap_questions(text, max_q=1)
+    # If opener is weak, just trim it (no new words)
+    if WEAK_OPENERS_RE.match(text):
+        text = WEAK_OPENERS_RE.sub('', text).strip().capitalize()
+    return text
+
+def _first_clause(text: str) -> str:
+    return re.split(r'[.!?—–,:;]\s+', text.strip(), maxsplit=1)[0]
+
+def _is_benefit_first(text: str) -> bool:
+    first = _first_clause(text).lower()
+    if any(first.startswith(p.lower()) for p in BENEFIT_PREFIXES): 
+        return True
+    return any(v in first.split() for v in BENEFIT_VERBS)
+
+def _has_single_cta(text: str) -> bool:
+    return len(CTA_RE.findall(text)) <= 1
+
+def _keep_first_cta_drop_rest(text: str) -> str:
+    """If multiple CTAs, keep the sentence containing the first and drop other CTA sentences."""
+    if _has_single_cta(text): 
+        return text
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    out, kept_first = [], False
+    for s in sentences:
+        if CTA_RE.search(s):
+            if not kept_first:
+                out.append(s); kept_first = True
+            # else drop
+        else:
+            out.append(s)
+    return PostProcessor.normalize_spaces(" ".join(out))
+
+def enforce_promo_style(original: str, text: str) -> str:
+    # Payoff before link (your helper already moves early links, but ensure benefit-first)
+    if not _is_benefit_first(text):
+        text = f"You get: {text}"
+    # Require one proof/number if the original had one (don't fabricate)
+    if (KEY_NUMBER_RE.search(original) or YEAR_RE.search(original)) and not (KEY_NUMBER_RE.search(text) or YEAR_RE.search(text)):
+        # move numeric sentence from original if missing
+        text = PostProcessor.normalize_spaces(f"{_first_clause(original)} — {text}")
+    # Exactly one CTA
+    text = _keep_first_cta_drop_rest(text)
+    return text
+
+def enforce_general_style(original: str, text: str) -> str:
+    # Ensure there is a hook/novel angle; if not, prepend an allowed hook
+    if not is_hook_variant(text):
+        # Prefer "Hot take:" if it won't clash with tone
+        text = f"Hot take: {text}"
+    return text
+
+def apply_type_style(original: str, text: str, kind: str) -> Tuple[str, bool]:
+    """
+    Returns (possibly_edited_text, ok_flag). ok_flag False means it violates 'one idea only'.
+    """
+    if kind == "news":
+        text = enforce_news_style(original, text)
+    elif kind == "personal":
+        text = enforce_personal_style(original, text)
+    elif kind == "promo":
+        text = enforce_promo_style(original, text)
+    else:  # general
+        text = enforce_general_style(original, text)
+
+    # One-idea-only gate
+    if not one_idea_only_ok(text):
+        text = compress_to_one_idea(text)
+        if not one_idea_only_ok(text):
+            return text, False  # still too multi-idea; caller may drop
+    return text, True
+
+
 # =========================
 # 6) SCORERS (stubs)
 # =========================
+def _normalize_engine_output(data):
+    """Return (likes, retweets, replies) as floats from various engine output shapes."""
+    # pydantic/dataclass/obj → dict
+    if hasattr(data, "dict"):
+        data = data.dict()
+    if isinstance(data, dict):
+        likes = float(data.get("likes", 0.0))
+        retweets = float(data.get("retweets", data.get("rts", 0.0)))
+        replies = float(data.get("replies", 0.0))
+        return (likes, retweets, replies)
+    raise TypeError(f"Unsupported engine output shape: {type(data)} {repr(data)[:120]}")
+
 class BaseScorer:
     def score(self, text: str) -> Score:
         raise NotImplementedError
 
 class MLScorer(BaseScorer):
-    def __init__(self, alpha: float = None, beta: float = None):
+    _scorer_warmed_up = False
+    _scorer_warmup_lock = threading.Lock()
+
+    def __init__(self, alpha: float = None, beta: float = None, followers: Optional[int] = None):
         # TODO: wire your EnhancedPersonaEngine.predict_virality here
         self.ready = _SCORING_STACK_AVAILABLE
         self.alpha = alpha or ALPHA_RETWEETS
         self.beta = beta or BETA_REPLIES
+        self.followers = followers
 
-    def score(self, text: str) -> Score:
+        # Warm up scorer only once per process
+        if SCORER_URL and not MLScorer._scorer_warmed_up:
+            with MLScorer._scorer_warmup_lock:
+                if not MLScorer._scorer_warmed_up:
+                    wait_for_scorer_ready(timeout=15, interval=0.5, verbose=True)
+                    MLScorer._scorer_warmed_up = True
+
+    def score(self, text: str, followers: Optional[int] = None) -> Score:
+        use_followers = followers if followers is not None else self.followers or globals().get("FOLLOWERS_FOR_RUN", None)
+        # 1) HTTP scorer takes precedence if set
         if SCORER_URL:
             payload = {"text": text}
+            if use_followers is not None:
+                payload["followers"] = int(use_followers)
             last_err = None
-            for _ in range(2):  # retry twice
+            for _ in range(2):
                 try:
-                    r = requests.post(SCORER_URL, json=payload, timeout=SCORER_TIMEOUT)
+                    r = _SESSION.post(SCORER_URL, json=payload, timeout=SCORER_TIMEOUT)
                     r.raise_for_status()
                     data = r.json()
                     likes = float(data.get("likes", 0.0))
@@ -1023,10 +1494,26 @@ class MLScorer(BaseScorer):
                     time.sleep(0.25)
             log.error("Scorer API failed after retries: %s. Falling back.", last_err)
 
-        # fallback heuristic if API fails
+        # 2) Local persona_engine (your repo)
+        if ENGINE is not None:
+            try:
+                for method_name in ("predict_virality", "predict", "score"):
+                    fn = getattr(ENGINE, method_name, None)
+                    if not callable(fn):
+                        continue
+                    raw = fn(text)
+                    # helpful once: log the shape
+                    log.debug("persona_engine output type=%s preview=%r", type(raw), raw if isinstance(raw, (int,float)) else (list(raw.keys()) if isinstance(raw, dict) else raw))
+                    likes, rts, reps = _normalize_engine_output(raw)
+                    comp = likes + self.alpha * rts + self.beta * reps
+                    return Score(likes=likes, retweets=rts, replies=reps, composite=comp, details={"raw": raw})
+            except Exception as e:
+                log.warning("persona_engine scoring failed; using heuristic fallback. (%s)", e)
+
+        # 3) Final fallback heuristic
         hook_bonus = 0.2 if any(x in text.lower() for x in ["breaking", "new", "just in", "thread"]) else 0.0
-        q_bonus = 0.15 if "?" in text else 0.0
-        len_bonus = 0.2 if 80 <= len(text) <= 180 else 0.0
+        q_bonus    = 0.15 if "?" in text else 0.0
+        len_bonus  = 0.2  if 80 <= len(text) <= 180 else 0.0
         comp = 1.0 + hook_bonus + q_bonus + len_bonus
         return Score(likes=comp, retweets=comp*0.35, replies=comp*0.25, composite=comp)
 
@@ -1069,8 +1556,17 @@ def deterministic_variants(original: str, n: int) -> List[str]:
         return f"{t}{sep}{cta}"
 
     def stat_first(t):
-        m = re.search(r'(\b\d[\d,\.%kK]*\b.*?)([.!?])', t)
-        return (m.group(1).strip() + " — " + t).strip() if m else t
+        urls = LINK_RE.findall(t)
+        safe = LINK_RE.sub("__URL__", t)
+        # Improved regex: captures optional $/currency, keeps %/k/K, etc.
+        m = re.search(r'(\$?\d[\d,\.\'%kK]*\b.*?)([.!?])', safe)
+        if not m:
+            return t
+        chunk = m.group(1).replace("__URL__", urls[0] if urls else "")
+        # avoid duplicating the same clause
+        if chunk and chunk.lower() in t.lower():
+            return t
+        return (chunk.strip() + " — " + t).strip()
 
     def tighten(t):
         return tighten_to_limit(t, limit=260)
@@ -1166,17 +1662,25 @@ def parse_gemini_variants(response_text: str, expected: int) -> List[str]:
     if not isinstance(response_text, str):
         return []
 
-    # Try JSON parse first
-    try:
-        obj = json.loads(response_text)
-        if isinstance(obj, dict) and "variants" in obj and isinstance(obj["variants"], list):
-            return [str(x).strip() for x in obj["variants"]][:expected]
-        if isinstance(obj, list) and all(isinstance(x, str) for x in obj):
-            return [x.strip() for x in obj][:expected]
-    except Exception:
-        pass
+    s = response_text.strip()
 
-    # Fallback: parse numbered lines
+    # 1) If there’s a fenced block, pull JSON out of it
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", s, re.DOTALL)
+    if m:
+        s = m.group(1).strip()
+
+    # 2) Try to isolate the first {...} that contains "variants"
+    if "variants" in s:
+        try:
+            start = s.index("{")
+            end = s.rfind("}") + 1
+            obj = json.loads(s[start:end])
+            if isinstance(obj, dict) and isinstance(obj.get("variants"), list):
+                return [str(x).strip() for x in obj["variants"]][:expected]
+        except Exception:
+            pass
+
+    # 3) Last resort: numbered-line fallback
     return parse_numbered_list(response_text, expected=expected)
 
 # --- ADD: tighten to <=260 chars while preserving entities & meaning ---
@@ -1212,13 +1716,18 @@ def tighten_to_limit(text: str, limit: int = 260, entities: "Entities" = None) -
 
 # --- ADD: smart truncate + reinsert entities + dedupe + diversity ----------
 
+def _clean_tail(s: str) -> str:
+    return re.sub(r'[\s,;:–—-]+$', '', s).strip()
+
 def _smart_truncate(s: str, limit: int = CHAR_LIMIT) -> str:
-    if len(s) <= limit: return s
+    if len(s) <= limit: 
+        return _clean_tail(s)
     cut = s[:limit]
     for p in [r'\.\s', r'!\s', r'\?\s', r'—\s', r',\s', r'\s']:
         m = list(re.finditer(p, cut))
-        if m: return cut[:m[-1].end()].strip()
-    return cut.strip()
+        if m:
+            return _clean_tail(cut[:m[-1].end()])
+    return _clean_tail(cut)
 
 def reinsert_missing_entities(candidate: str, ent) -> str:
     out = candidate
@@ -1297,11 +1806,19 @@ def _simple_similarity(a: str, b: str) -> int:
     return int((intersection / union) * 100) if union > 0 else 0
 
 def ensure_diversity(cands: List[str]) -> List[str]:
-    if not cands: return cands
+    if not cands:
+        return cands
     # Light nudge only (don’t add any generic question text)
     has_stat = any(KEY_NUMBER_RE.search(c) for c in cands)
-    out = list(cands)
-    # If no stat anywhere, just leave as-is; we rely on LLM + Step B backstops.
+    out = []
+    import re
+    for s in cands:
+        # Filter obvious junk before keeping a variant
+        if re.search(r'\babout\s+\d+\?\b', s):
+            continue
+        # Clean up 'Reminder:'/Hot take: prefix if doubled
+        s = re.sub(r'\bReminder:\s*Hot take:\s*', 'Hot take: ', s)
+        out.append(s)
     return out
 
 # --- ADD: optional topical hashtag enrichment -------------------------------
@@ -1322,10 +1839,13 @@ def maybe_add_trending_hashtag(s: str, trending: Optional[set]) -> str:
 PERSONA_SAMPLE_MAX = int(os.getenv("PERSONA_SAMPLE_MAX", "1000"))
 
 def _sample_personas(personas, text: str, k: int = PERSONA_SAMPLE_MAX):
-    if len(personas) <= k: 
+    if len(personas) <= k:
         return personas
-    seed = int(hashlib.md5(text.encode("utf-8")).hexdigest()[:8], 16)
-    rnd = random.Random(seed)
+    return _sample_personas_with_seed(personas, text, k)
+
+def _sample_personas_with_seed(personas, text: str, k: int = PERSONA_SAMPLE_MAX, seed: Optional[int] = None):
+    use_seed = seed if seed is not None else int(hashlib.md5(text.encode("utf-8")).hexdigest()[:8], 16)
+    rnd = random.Random(use_seed)
     return rnd.sample(personas, k)
 
 # --- ADD: light hook/clarity rubric for tie-breaks --------------------------
@@ -1389,12 +1909,13 @@ def rank_with_elo(original: str, texts: List[str], personas: List[Dict]):
     return ranked, base_score
 
 def blended_rank(original: str, variants: List[str], scorer_ml: "MLScorer", personas: List[Dict]):
-    # 1) ML scores
-    with ThreadPoolExecutor(max_workers=min(16, len(variants))) as ex:
-        futs = {ex.submit(scorer_ml.score, v): v for v in variants}
-        ml_scores = { key: future.result() for key, future in futs.items() }
-
-    base_ml = scorer_ml.score(original)
+    # 1) ML scores (batch original and variants)
+    texts = [original] + variants
+    ml_scores_all = _ml_score_parallel(texts, followers=scorer_ml.followers if hasattr(scorer_ml, 'followers') else None)
+    ml_scores = {v: ml_scores_all[v] for v in variants}
+    base_ns = ml_scores_all[original]
+    base_ml = Score(likes=base_ns.likes, retweets=base_ns.retweets,
+                    replies=base_ns.replies, composite=base_ns.composite)
 
     # 2) Elo scores (normalize 0..1) for original + variants
     results = run_elo_tournament([original] + variants, personas)
@@ -1425,8 +1946,16 @@ def blended_rank(original: str, variants: List[str], scorer_ml: "MLScorer", pers
         )
 
     blended.sort(key=lambda r: r.score.composite, reverse=True)
+    if not blended:
+        raise RuntimeError("No valid variants to rank. All candidates were filtered out or scoring failed.")
     winner     = blended[0]
-    alternates = blended[1:7]
+    # Dynamic alternates cap: respect --num_variants or uncap to all alternates
+    import inspect
+    alt_cap = max(0, int(len(variants) - 1))
+    frame = inspect.currentframe().f_back
+    if frame and "alt_cap" in frame.f_locals:
+        alt_cap = frame.f_locals["alt_cap"]
+    alternates = blended[1:1+max(0, int(alt_cap))]
 
     # 4) Compute a BLENDED base score for the ORIGINAL too (apples-to-apples)
     base_blended = Score(
@@ -1492,12 +2021,33 @@ def _ml_score_worker(text: str):
     comp = (s.likes + ALPHA_RETWEETS * s.retweets + BETA_REPLIES * s.replies)  # unify composite
     return (text, float(s.likes), float(s.retweets), float(s.replies), float(comp))
 
-def _ml_score_parallel(texts: List[str]) -> Dict[str, SimpleNamespace]:
-    # returns {text: Score-like(simple namespace)}
-    exec_ = _get_ml_exec()
+def _ml_score_parallel(texts: List[str], followers: Optional[int] = None) -> Dict[str, SimpleNamespace]:
+    # Only use /predict endpoint for ML scoring
+    if not SCORER_URL:
+        # Fallback: local scoring (rare in your setup)
+        results = {}
+        for t in texts:
+            s = MLScorer().score(t, followers=followers)
+            comp = s.likes + ALPHA_RETWEETS * s.retweets + BETA_REPLIES * s.replies
+            results[t] = SimpleNamespace(likes=float(s.likes), retweets=float(s.retweets),
+                                         replies=float(s.replies), composite=float(comp))
+        return results
+
+    # Use /predict for each text
+    use_followers = followers if followers is not None else globals().get("FOLLOWERS_FOR_RUN", None)
     results = {}
-    for text, lk, rt, rp, comp in exec_.map(_ml_score_worker, texts):
-        results[text] = SimpleNamespace(likes=lk, retweets=rt, replies=rp, composite=comp)
+    for t in texts:
+        payload = {"text": t, "return_details": False}
+        if use_followers is not None:
+            payload["followers"] = int(use_followers)
+        r = _SESSION.post(SCORER_URL, json=payload, timeout=SCORER_TIMEOUT)
+        r.raise_for_status()
+        d = r.json()
+        likes  = float(d.get("likes", 0.0))
+        rts    = float(d.get("retweets", 0.0))
+        reps   = float(d.get("replies", 0.0))
+        comp   = likes + ALPHA_RETWEETS * rts + BETA_REPLIES * reps
+        results[t] = SimpleNamespace(likes=likes, retweets=rts, replies=reps, composite=comp)
     return results
 
 # --- REPLACE: choose_winner with success-criteria aware selection ------------
@@ -1510,12 +2060,12 @@ def choose_winner(original: str, variants: List[Variant], *, scorer: Optional[Ba
     """
     scorer = scorer or MLScorer()
 
-    # score original
-    base_score = scorer.score(original)
-
-    # ✅ parallel ML scoring without pickling a bound method
-    texts = [v.text for v in variants]
-    parallel_scores = _ml_score_parallel(texts)  # {text: SimpleNamespace(...)}
+    # Batch original and candidates for scoring
+    texts = [original] + [v.text for v in variants]
+    parallel_scores = _ml_score_parallel(texts, followers=globals().get("FOLLOWERS_FOR_RUN", None))  # {text: SimpleNamespace(...)}
+    base_ns = parallel_scores[original]
+    base_score = Score(likes=base_ns.likes, retweets=base_ns.retweets,
+                       replies=base_ns.replies, composite=base_ns.composite)
 
     ranked = sorted(
         [
@@ -1547,7 +2097,13 @@ def choose_winner(original: str, variants: List[Variant], *, scorer: Optional[Ba
     except Exception:
         pass
 
-    return ranked[0], ranked[1:7], base_score
+    # Dynamic alternates cap: respect --num_variants or uncap to all alternates
+    import inspect
+    alt_cap = max(0, int(len(variants) - 1))
+    frame = inspect.currentframe().f_back
+    if frame and "alt_cap" in frame.f_locals:
+        alt_cap = frame.f_locals["alt_cap"]
+    return ranked[0], ranked[1:1+max(0, int(alt_cap))], base_score
 
 # --- REPLACE: improve_tweet to implement the exact I/O contract --------------
 
@@ -1556,8 +2112,12 @@ def improve_tweet(
     tweet_text: str,
     mode: Optional[str] = None,
     num_variants: int = NUM_VARIANTS_DEFAULT,
-    return_all: bool = False
+    return_all: bool = False,
+    followers: Optional[int] = None
 ) -> Dict:
+    # Use followers from argument, or fallback to global if set
+    if followers is None:
+        followers = globals().get("FOLLOWERS_FOR_RUN", None)
     t_total = time.time()
     timings: Dict[str, float] = {}
 
@@ -1579,7 +2139,7 @@ def improve_tweet(
     prompt = PromptBuilder.build(tweet_text, analysis, n=num_variants)
     timings["prompt_ms"] = round((time.time() - t0) * 1000, 2)
 
-    # 4) Generate 5–7 variants with Gemini
+    # 4) Generate variants with Gemini
     # --- REPLACE: LLM call with robust fallback ---
     t0 = time.time()
     fallback_used = False
@@ -1592,303 +2152,33 @@ def improve_tweet(
             timeout=GEN_TIMEOUT_S,
             retries=GEN_RETRIES
         )
-        response_text = llm.generate_variants(prompt, n=num_variants)  # returns raw text from API
-        # Prefer JSON-first parser that accepts a strict JSON object or a fallback numbered list
+        response_text = llm.generate_variants(prompt, n=num_variants)
         if isinstance(response_text, str):
             raw_lines = parse_gemini_variants(response_text, expected=num_variants)
         else:
-            # Fallback case where generate_variants already returns a list
             raw_lines = list(response_text)[:num_variants]
+
+        if len(raw_lines) < num_variants:
+            need = num_variants - len(raw_lines)
+            raw_lines += deterministic_variants(tweet_text, n=need)
+            raw_lines = MiniPost.dedupe(raw_lines)[:num_variants]
     except Exception as e:
         log.warning("LLM generation failed (%s). Falling back to deterministic variants.", e)
         raw_lines = deterministic_variants(tweet_text, n=num_variants)
         fallback_used = True
     timings["llm_ms"] = round((time.time() - t0) * 1000, 2)
-    log.debug("Raw variants: %s", raw_lines)
 
-    # --- ADD: if all candidates are too long, run tighten pass to <=260 ---
-    if all(len(v.strip()) > CHAR_LIMIT for v in raw_lines):
-        log.info("All LLM candidates over 280. Tightening to <=260 and retrying limits.")
-        tightened = [tighten_to_limit(v, limit=260, entities=analysis.entities) for v in raw_lines]
-        raw_lines = tightened
-
-    # 5) Post-process & enforce constraints
-    t0 = time.time()
-    orig_entities = analysis.entities  # same object you already have
-    processed: List[str] = []
-    # --- UPDATE guardrail budgets from config ---
+    # 5) Post-process and convert to Variant objects
     max_emojis_budget = MAX_EMOJIS_NEWS if analysis.tweet_type in {"news","announcement"} else MAX_EMOJIS_GENERAL
-    constraints_applied = [
-        f"preserve_hashtags<=orig+{MAX_NEW_HASHTAGS}",
-        f"max_emojis<={max_emojis_budget}",
-        f"allow_cta={'yes' if ALLOW_CTA_DEFAULT else 'no'}",
-        "char_limit<=280", "preserve_links/mentions", "no_new_numbers/dates", "keep_language", "tone_safety"
-    ]
-
-    # Track detailed constraint enforcement stats
-    constraint_stats = {
-        "dropped_extra_hashtags": 0,
-        "trimmed_emojis": 0,
-        "length_truncated": 0,
-        "guardrail_violations": 0
-    }
-
-    # Extract key facts once for safety checks
-    key_facts = _extract_key_facts(tweet_text)
-
-    for line in raw_lines:
-        # sanitize & normalize
-        s1 = PostProcessor.sanitize(line, orig_entities, original=tweet_text)
-        s1 = PostProcessor.ensure_takeaway_before_link(tweet_text, s1)   # ← NEW (A5)
-
-        # First-pass dedupe
-        processed = PostProcessor.dedupe(processed)
-
-        # Ensure length variety (≤60 and 200–240)
-        processed = enforce_length_variety(processed, tweet_text, orig_entities)
-
-        # Ensure Step-B roles are covered across the set
-        processed = ensure_engagement_mechanics(processed, tweet_text, orig_entities)
-
-        # Optional extra diversity hook (no-op currently)
-        processed = ensure_diversity(processed)
-
-        # Trending enrichment (re-enforce limits afterward)
-        if TRENDING_ENABLED and processed:
-            try:
-                trending = get_trending_cached()
-                if analysis.tweet_type in ("news", "general") and trending:
-                    enriched = maybe_add_trending_hashtag(processed[0], trending)
-                    processed[0] = PostProcessor.enforce_limits(
-                        enriched, orig_entities,
-                        max_new_hashtags=MAX_NEW_HASHTAGS,
-                        max_emojis=max_emojis_budget,
-                        hard_char_cap=CHAR_LIMIT
-                    )
-            except Exception as e:
-                log.debug("Trending hashtag enrichment failed: %s", e)
-
-        # --- ADD: last length guard ---
-        processed = [PostProcessor.smart_truncate(p, limit=CHAR_LIMIT) for p in processed]
-        variants = [Variant(text=p) for p in processed]
-        timings["post_ms"] = round((time.time() - t0) * 1000, 2)
-        try:
-            trending_hashtags = get_trending_cached()
-            trending_ok = bool(trending_hashtags)
-        except Exception:
-            trending_ok = False
-        
-        if analysis.tweet_type in ("news", "general") and trending_ok and processed:
-            try:
-                processed[0] = maybe_add_trending_hashtag(processed[0], trending_hashtags)
-            except Exception as e:
-                log.debug("Trending hashtag enrichment failed: %s", e)
-    processed = PostProcessor.dedupe(processed)
-    # Ensure length variety from Section A (<=60 and 200–240) if the model missed it
-    processed = enforce_length_variety(processed, tweet_text, orig_entities)
-    log.debug("Processed variants: %s", processed)
-    variants = [Variant(text=p) for p in processed]
-    timings["post_ms"] = round((time.time() - t0) * 1000, 2)
-    
-    # --- ADD: sprinkle caches where helpful (example callsites) ---
-    # During post-process diversity heuristics:
-    base_feat = _light_features(tweet_text)
-    cand_feats = {t: _light_features(t) for t in processed}
-    # ... prefer at least one variant with a question, one with stat, etc.
-    
-    processed = ensure_diversity(processed)
-    
-    # --- USE TRENDING TOGGLE BEFORE OPTIONAL ENRICHMENT ---
-    if TRENDING_ENABLED:
-        # Optional trending hashtag enrichment
-        # Check if trending data is available independently of scoring stack
-        trending_ok = False
-        try:
-            trending_hashtags = get_trending_cached()
-            trending_ok = bool(trending_hashtags)
-        except Exception:
-            trending_ok = False
-        
-        if analysis.tweet_type in ("news", "general") and trending_ok and processed:
-            try:
-                processed[0] = maybe_add_trending_hashtag(processed[0], trending_hashtags)
-            except Exception as e:
-                log.debug("Trending hashtag enrichment failed: %s", e)
-    
-   
-    
-    # --- ADD: last length guard ---
-    processed = [PostProcessor.smart_truncate(p, limit=CHAR_LIMIT) for p in processed]
-    variants = [Variant(text=p) for p in processed]
-    timings["post_ms"] = round((time.time() - t0) * 1000, 2)
-
-    # 6) Score & select with mode switch
-    # --- UPDATE scoring mode switch & weights ---
-    t0 = time.time()
-    scorer_ml = MLScorer(alpha=ALPHA_RETWEETS, beta=BETA_REPLIES)
-
-    if SCORING_MODE_DEFAULT == "ml":
-        winner, alternates, base_score = choose_winner(tweet_text, variants, scorer=scorer_ml)
-
-    elif SCORING_MODE_DEFAULT == "elo":
-        # sample personas for speed using deterministic sampling to avoid bias
-        personas_all = load_personas("personas.json")
-        personas_sub = _sample_personas(personas_all, tweet_text, k=PERSONA_SAMPLE_SIZE)
-        # wrap into Elo path (add original + variants)
-        ranked, base_score = rank_with_elo(tweet_text, [v.text for v in variants], personas_sub)
-        winner, alternates = ranked[0], ranked[1:7]
-
-    else:  # "blend"
-        personas_all = load_personas("personas.json")
-        personas_sub = _sample_personas(personas_all, tweet_text, k=PERSONA_SAMPLE_SIZE)
-        winner, alternates, base_score = blended_rank(
-            original=tweet_text,
-            variants=[v.text for v in variants],
-            scorer_ml=scorer_ml,
-            personas=personas_sub
-        )
-
-    timings["score_ms"] = round((time.time() - t0) * 1000, 2)
-
-    # 7) Build deltas & explanations
-    # --- Extract results from different scoring modes ---
-    if SCORING_MODE_DEFAULT == "ml":
-        # winner/alternates already have the right format from choose_winner
-        winner_text = winner.variant.text
-        winner_score = winner.score
-        original_score = base_score
-        alternates_list = [
-            {"text": alt.variant.text,
-             "predicted": {
-                 "likes": alt.score.likes,
-                 "retweets": alt.score.retweets,
-                 "replies": alt.score.replies,
-                 "composite": alt.score.composite
-             }}
-            for alt in alternates
-        ] if return_all else []
-        personas_for_elo = []  # not used in ML mode
-        
-    elif SCORING_MODE_DEFAULT == "elo":
-        # Extract from ranked results
-        winner_text = winner.variant.text
-        winner_score = winner.score
-        original_score = base_score
-        alternates_list = [
-            {"text": alt.variant.text,
-             "predicted": {
-                 "likes": alt.score.likes,
-                 "retweets": alt.score.retweets,
-                 "replies": alt.score.replies,
-                 "composite": alt.score.composite
-             }}
-            for alt in alternates
-        ] if return_all else []
-        personas_for_elo = personas_sub
-        
-    else:  # "blend"
-        # Extract from blended results
-        winner_text = winner.variant.text
-        winner_score = winner.score
-        original_score = base_score
-        alternates_list = [
-            {"text": alt.variant.text,
-             "predicted": {
-                 "likes": alt.score.likes,
-                 "retweets": alt.score.retweets,
-                 "replies": alt.score.replies,
-                 "composite": alt.score.composite
-             }}
-            for alt in alternates
-        ] if return_all else []
-        personas_for_elo = personas_sub
-
-    # --- REPLACE: payload winner/alternates population (variables changed above) --
-    likes_delta = (winner_score.likes - original_score.likes)
-    comp_delta  = (winner_score.composite - original_score.composite)
-    pct_improve = 0.0 if original_score.composite == 0 else (comp_delta / original_score.composite)
-
-    # --- ADD: no-uplift notice & guardrail logging ---
-    notices = []
-    if winner_text == tweet_text or winner_score.composite <= original_score.composite:
-        notices.append("No predicted improvement over original; showing strongest candidate.")
-
-    if fallback_used:
-        notices.append("LLM unavailable; used deterministic fallback variants.")
-
-    why = (f"Highest {SCORING_MODE_DEFAULT} score (ML: composite | Elo: persona rank | Blend: 70% ML + 30% Elo) "
-           "AND higher engagement than original."
-           if winner_text != tweet_text
-           else "No generated version beat the original on metrics; keeping the original.")
-
-    explanations = {
-        "why_this_won": why,
-        "detected_type": analysis.tweet_type,
-        "applied_transformations": [
-            "kept links/@mentions/numbers/dates",
-            "tightened to ≤280 chars",
-            "capped emojis/hashtags",
-            "prompted for clearer hook and benefit",
-            "diversified tones/forms (question/imperative/stat)"
-        ],
-        "constraints_applied": constraints_applied,
-        "constraint_stats": constraint_stats,  # detailed enforcement statistics
-        "fallback_used": fallback_used,  # track if deterministic variants were used
-        "scoring": {
-            "mode": SCORING_MODE_DEFAULT,
-            "weights": {"ml": BLEND_W_ML, "elo": BLEND_W_ELO} if SCORING_MODE_DEFAULT == "blend" else {},
-            "ml_formula": f"likes + {ALPHA_RETWEETS}·retweets + {BETA_REPLIES}·replies",
-            "elo_personas_used": min(PERSONA_SAMPLE_SIZE, len(personas_for_elo)) if personas_for_elo else 0
-        }
-    }
-
-    guardrails = [
-        "Preserved links and @mentions; original hashtags retained when present; added ≤1 new hashtag.",
-        "Hard cap at 280 characters (Unicode).",
-        "Emojis capped at 2 (1 for news).",
-        "Did not alter numbers or dates; no new factual claims.",
-        "Kept original language/script; did not translate.",
-        "Kept tone respectful; avoided medical/financial advice changes."
-    ]
-
-    timings["total_ms"] = round((time.time() - t_total) * 1000, 2)
-
-    # 8) Return EXACT contract for your frontend
-    payload = {
-        "winner": {
-            "text": winner_text,
-            "predicted": {
-                "likes": winner_score.likes,
-                "retweets": winner_score.retweets,
-                "replies": winner_score.replies,
-                "composite": winner_score.composite
-            },
-            "delta_vs_original": {
-                "likes_delta": likes_delta,
-                # pct is composite % improvement for stability across metrics
-                "pct": f"{pct_improve * 100:.1f}%"
-            }
-        },
-        "alternates": [] if not return_all else alternates_list,
-        "explanations": explanations,
-        "guardrails": guardrails,
-        "notices": notices,
-        "timings": timings
-    }
-    
-    # --- ADD: telemetry about fallbacks ---
-    payload.setdefault("meta", {})
-    payload["meta"].update({
-        "fallback_used": fallback_used,
-        "num_candidates": len(variants)
-    })
-    
-    # Log telemetry for offline evaluation  
-    selection_mode = SCORING_MODE_DEFAULT
-    winner_for_log = RankedVariant(variant=Variant(text=winner_text), score=winner_score)
-    _log_telemetry(tweet_text, winner_for_log, timings, analysis, original_score, selection_mode)
-    
-    return payload
+    processed = MiniPost.batch(
+        original=tweet_text,
+        candidates=raw_lines,
+        entities=analysis.entities,
+        max_new_hashtags=MAX_NEW_HASHTAGS,
+        max_emojis=max_emojis_budget,
+        limit=CHAR_LIMIT
+    )
+    variants = [Variant(text=v) for v in processed]
 
 # =========================
 # 9) CLI/LOCAL TEST
@@ -1897,31 +2187,126 @@ if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Tweet improvement engine")
     parser.add_argument("tweet_text", type=str, help="The tweet text to improve")
     parser.add_argument("--return_all", action="store_true", help="Include alternates in the output")
     parser.add_argument("--mode", type=str, default="auto", help="Improvement mode")
-    parser.add_argument("--num_variants", type=int, default=6, help="Number of variants")
+    parser.add_argument("--num_variants", type=int, default=NUM_VARIANTS_DEFAULT, help="Number of variants")
+    parser.add_argument("--print_all_llm", action="store_true", help="Print all LLM-generated tweets (raw, before post-processing)")
+    parser.add_argument("--followers", type=int, help="Follower count to use for scoring")
+    parser.add_argument("--persona-seed", type=int, help="Seed for persona sampling (stabilizes Elo)")
     args = parser.parse_args()
-    
+
+    # --- Follower count: ask every run or via flag ---
+    FOLLOWERS_FOR_RUN = args.followers
+    if FOLLOWERS_FOR_RUN is None:
+        try:
+            FOLLOWERS_FOR_RUN = int(input("How many followers should we assume for scoring? ").strip())
+        except Exception:
+            FOLLOWERS_FOR_RUN = 100_000  # reasonable default
+
+    # Persona seed for stable Elo sampling
+    PERSONA_SEED_FOR_RUN = args.persona_seed if args.persona_seed is not None else FOLLOWERS_FOR_RUN
+
+    # --- BEGIN: Show pre/post-processing variants for CLI/debug ---
+    t_total = time.time()
+    tweet_text = args.tweet_text
+    mode = args.mode
+    num_variants = args.num_variants
+    return_all = args.return_all
+
+    t0 = time.time()
+    tweet_text_clean, analysis = precheck_and_parse(tweet_text)
+    prompt = PromptBuilder.build(tweet_text_clean, analysis, n=num_variants)
+
+    fallback_used = False
+    raw_lines = []
+    try:
+        llm = GeminiClient(
+            api_key=GEMINI_API_KEY,
+            model=GEMINI_MODEL,
+            temperature=TEMPERATURE,
+            timeout=GEN_TIMEOUT_S,
+            retries=GEN_RETRIES
+        )
+        response_text = llm.generate_variants(prompt, n=num_variants)
+        if isinstance(response_text, str):
+            raw_lines = parse_gemini_variants(response_text, expected=num_variants)
+        else:
+            raw_lines = list(response_text)[:num_variants]
+        if len(raw_lines) < num_variants:
+            need = num_variants - len(raw_lines)
+            raw_lines += deterministic_variants(tweet_text_clean, n=need)
+            raw_lines = MiniPost.dedupe(raw_lines)[:num_variants]
+    except Exception as e:
+        log.warning("LLM generation failed (%s). Falling back to deterministic variants.", e)
+        raw_lines = deterministic_variants(tweet_text_clean, n=num_variants)
+        fallback_used = True
+
+    if args.print_all_llm:
+        print("\n=== ALL LLM-GENERATED TWEETS (RAW) ===")
+        for i, v in enumerate(raw_lines, 1):
+            print(f"{i}. {v}")
+    else:
+        print("\n=== RAW VARIANTS (pre post-processing) ===")
+        for i, v in enumerate(raw_lines, 1):
+            print(f"{i}. {v}")
+
+    orig_entities = analysis.entities
+    max_emojis_budget = MAX_EMOJIS_NEWS if analysis.tweet_type in {"news","announcement"} else MAX_EMOJIS_GENERAL
+    processed = MiniPost.batch(
+        original=tweet_text_clean,
+        candidates=raw_lines,
+        entities=orig_entities,
+        max_new_hashtags=MAX_NEW_HASHTAGS,
+        max_emojis=max_emojis_budget,
+        limit=CHAR_LIMIT
+    )
+
+    print("\n=== POST-PROCESSED VARIANTS ===")
+    for i, v in enumerate(processed, 1):
+        print(f"{i}. {v}")
+
+    # 5) Call improve_tweet for final scoring and output
+    # Patch all Elo/blend scoring calls to use the persona seed
+    def patched_sample_personas(personas, text, k=PERSONA_SAMPLE_SIZE, seed=None):
+        return _sample_personas_with_seed(personas, text, k=k, seed=PERSONA_SEED_FOR_RUN)
+
+    _sample_personas_orig = _sample_personas
+    _sample_personas = patched_sample_personas
+
     result = improve_tweet(
         tweet_text=args.tweet_text,
         mode=args.mode,
         num_variants=args.num_variants,
         return_all=args.return_all,
+        followers=FOLLOWERS_FOR_RUN,
     )
-    
+
+    # Restore original _sample_personas in case of further use
+    _sample_personas = _sample_personas_orig
+
     print("\n=== WINNER ===")
-    print(result["winner"]["text"])
-    print("Predicted:", result["winner"]["predicted"])
-    print("Delta vs original:", result["winner"]["delta_vs_original"])
-    
+
+    if not result or not result.get("winner"):
+        print("No winning variant could be selected. All candidates may have been filtered out or failed scoring.")
+    else:
+        print(result["winner"]["text"])
+        print("Predicted:", result["winner"]["predicted"])
+        print("Delta vs original:", result["winner"]["delta_vs_original"])
+
     print("\n=== ALTERNATES ===")
-    for alt in result["alternates"]:
-        print("-", alt["text"], alt["predicted"])
-    
+    if not result or not result.get("alternates"):
+        print("No alternates available.")
+    else:
+        for alt in result["alternates"]:
+            print("-", alt["text"], alt["predicted"])
+
     print("\n=== CONTEXT ===")
-    print("Why this won:", result["explanations"]["why_this_won"])
-    print("Applied transforms:", result["explanations"]["applied_transformations"])
-    print("Guardrails:", result["guardrails"])
+    if not result or not result.get("explanations"):
+        print("No context/explanations available.")
+    else:
+        print("Why this won:", result["explanations"].get("why_this_won", "N/A"))
+        print("Applied transforms:", result["explanations"].get("applied_transformations", "N/A"))
+        print("Guardrails:", result.get("guardrails", "N/A"))
