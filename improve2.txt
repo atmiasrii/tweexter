@@ -80,9 +80,7 @@ class MiniPost:
         return result
     @staticmethod
     def sanitize_basic(s: str, entities: 'Entities') -> str:
-        s = s.strip()
-        s = re.sub(r'^\s*(?:improve\s+this\s+tweet[:\-]?)\s*', '', s, flags=re.I)
-        s = re.sub(r'\(variant\s*#?\d+\)\s*$', '', s, flags=re.I)
+        # Stub: just return the string unchanged
         return s
     @staticmethod
     def batch(original: str, candidates: list, entities: 'Entities', max_new_hashtags: int, max_emojis: int, limit: int) -> list:
@@ -109,11 +107,8 @@ class MiniPost:
         return out
     @staticmethod
     def sanitize_basic(s: str, entities: 'Entities') -> str:
-        s = s.strip()
-        # strip artifacty prompts/suffixes that break guardrails
-        s = re.sub(r'^\s*(?:improve\s+this\s+tweet[:\-]?)\s*', '', s, flags=re.I)
-        s = re.sub(r'\s*\(variant\s*#?\d+\)\s*$', '', s, flags=re.I)
-        return s
+        # Minimal sanitization - strip whitespace; expand as needed
+        return s.strip()
     @staticmethod
     def batch(original: str, candidates: List[str], entities: 'Entities', max_new_hashtags: int, max_emojis: int, limit: int) -> List[str]:
         out = []
@@ -710,7 +705,8 @@ class TweetAnalyzer:
 class PromptBuilder:
     @staticmethod
     def build(text: str, analysis, n: int = 30) -> str:
-        # Build a rich JSON prompt for Gemini
+        # Stub: return a simple prompt string
+        return f"Improve this tweet: {text}"
         kind = getattr(analysis, "tweet_type", None) or "general"
         cfg  = get_style_constraints(kind)
         ent  = analysis.entities
@@ -907,60 +903,19 @@ class PromptBuilder:
 # 4) GEMINI CLIENT (real)
 # =========================
 class GeminiClient:
-
     def __init__(self, api_key: str, model: str, temperature: float, timeout: int = 20, retries: int = 2):
+        # Stub: just store the parameters
         self.api_key = api_key
         self.model = model
         self.temperature = temperature
         self.timeout = timeout
         self.retries = retries
-        if not self.api_key:
-            raise RuntimeError("GEMINI_API_KEY missing")
 
-    def _endpoint(self) -> str:
-        # REST v1beta generateContent
-        return f"https://generativelanguage.googleapis.com/v1beta/{self.model}:generateContent?key={self.api_key}"
-
-    def generate_variants(self, prompt: str, n: int, temperature: Optional[float] = None) -> List[str]:
-        body = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {
-                            "text": "You are an expert tweet editor. Follow the JSON instructions strictly.\n\n" + prompt
-                        }
-                    ],
-                }
-            ],
-            "generationConfig": {
-                "temperature": float(temperature if temperature is not None else self.temperature),
-                "maxOutputTokens": 1024,
-                "responseMimeType": "application/json",
-            },
-        }
-        last_err = None
-        for attempt in range(1, self.retries + 2):
-            try:
-                r = requests.post(self._endpoint(), json=body, timeout=self.timeout)
-                if r.status_code != 200:
-                    raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:200]}")
-                data = r.json()
-                text = (
-                    data.get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text", "")
-                )
-                variants = parse_gemini_variants(text, expected=n)
-                if not variants:
-                    raise ValueError("Empty variants from model")
-                return variants[:n]
-            except Exception as e:
-                last_err = e
-                log.warning("Gemini attempt %d failed: %s", attempt, e)
-                time.sleep(0.5 * attempt)
-        raise RuntimeError(f"Gemini failed after retries: {last_err}")
+    def generate_variants(self, prompt: str, n: int, temperature: Optional[float] = None) -> str:
+        # Stub: return a list of dummy variants as a JSON string
+        import json
+        variants = [f"{prompt} (variant {i+1})" for i in range(n)]
+        return json.dumps({"variants": variants})
 
 
 # =========================
@@ -1658,15 +1613,25 @@ def enforce_length_variety(variants: List[str], original: str, entities: Entitie
     return out
 
 def dedupe_near(lines: List[str], thresh: int = 92) -> List[str]:
-    kept: List[str] = []
-    seen = set()
-    for s in lines:
-        key = re.sub(r'\W+', '', s.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        kept.append(s)
-    return kept
+    """Dedupe using fuzzy matching. For now, use simple heuristic since fuzzywuzzy not imported."""
+    kept = []
+    # Ensure we always POST to the /predict endpoint, not the root URL
+    scorer_url = SCORER_URL.rstrip("/") + "/predict" if not SCORER_URL.rstrip("/").endswith("/predict") else SCORER_URL
+    for t in texts:
+        payload = {"text": t, "return_details": False}
+        if use_followers is not None:
+            payload["followers"] = int(use_followers)
+        # --- Print/log before POST request ---
+        print(f"[improve.py] Posting to SCORER_URL: {scorer_url} with payload: {payload}")
+        log.info(f"[improve.py] Posting to SCORER_URL: {scorer_url} with payload: {payload}")
+        r = _SESSION.post(scorer_url, json=payload, timeout=SCORER_TIMEOUT)
+        r.raise_for_status()
+        d = r.json()
+        likes  = float(d.get("likes", 0.0))
+        rts    = float(d.get("retweets", d.get("rts", 0.0)))
+        reps   = float(d.get("replies", 0.0))
+        comp   = likes + ALPHA_RETWEETS * rts + BETA_REPLIES * reps
+        results[t] = SimpleNamespace(likes=likes, retweets=rts, replies=reps, composite=comp)
 
 def ensure_diversity(cands: List[str]) -> List[str]:
     if not cands:
@@ -1818,26 +1783,25 @@ def _ml_score_worker(text: str):
 
 
 def _ml_score_parallel(texts: List[str], followers: Optional[int] = None) -> Dict[str, SimpleNamespace]:
+    # Only use /predict endpoint for ML scoring
     use_followers = followers if followers is not None else globals().get("FOLLOWERS_FOR_RUN", None)
-    results: Dict[str, SimpleNamespace] = {}
-    scorer_url = SCORER_URL.rstrip("/")
-    if not scorer_url.endswith("/predict"):
-        scorer_url += "/predict"
-
+    results = {}
     for t in texts:
         payload = {"text": t, "return_details": False}
         if use_followers is not None:
             payload["followers"] = int(use_followers)
-        log.info(f"[_ml_score_parallel] Posting to SCORER_URL: {scorer_url} with payload: {{'return_details': False, 'followers': %s}}", payload.get("followers"))
+        log.info(f"[_ml_score_parallel] Posting to SCORER_URL: {SCORER_URL} with payload: {payload}")
         try:
-            r = _SESSION.post(scorer_url, json=payload, timeout=SCORER_TIMEOUT)
+            r = _SESSION.post(SCORER_URL, json=payload, timeout=SCORER_TIMEOUT)
             log.info(f"[_ml_score_parallel] /predict status: {r.status_code}")
             r.raise_for_status()
             d = r.json()
+            log.info(f"[_ml_score_parallel] /predict response: {d}")
             likes  = float(d.get("likes", 0.0))
             rts    = float(d.get("retweets", d.get("rts", 0.0)))
             reps   = float(d.get("replies", 0.0))
             comp   = likes + ALPHA_RETWEETS * rts + BETA_REPLIES * reps
+            log.info(f"[_ml_score_parallel] Scored: likes={likes}, retweets={rts}, replies={reps}, composite={comp}")
             results[t] = SimpleNamespace(likes=likes, retweets=rts, replies=reps, composite=comp)
         except Exception as e:
             log.error(f"[_ml_score_parallel] Error scoring text '{t[:40]}': {e}")
@@ -1846,6 +1810,58 @@ def _ml_score_parallel(texts: List[str], followers: Optional[int] = None) -> Dic
 
 # --- REPLACE: choose_winner with success-criteria aware selection ------------
 
+def choose_winner(original: str, variants: List[Variant], *, scorer: Optional[BaseScorer] = None
+                 ) -> Tuple[RankedVariant, List[RankedVariant], Score]:
+    """
+    Scores original + candidates; only promote a variant if it beats the original.
+    Returns (winner, alternates_sorted, original_score).
+    """
+    scorer = scorer or MLScorer()
+
+    # Batch original and candidates for scoring
+    texts = [original] + [v.text for v in variants]
+    parallel_scores = _ml_score_parallel(texts, followers=globals().get("FOLLOWERS_FOR_RUN", None))  # {text: SimpleNamespace(...)}
+    base_ns = parallel_scores[original]
+    base_score = Score(likes=base_ns.likes, retweets=base_ns.retweets,
+                       replies=base_ns.replies, composite=base_ns.composite)
+
+    ranked = sorted(
+        [
+            RankedVariant(
+                variant=v,
+                score=Score(
+                    likes=parallel_scores[v.text].likes,
+                    retweets=parallel_scores[v.text].retweets,
+                    replies=parallel_scores[v.text].replies,
+                    composite=parallel_scores[v.text].composite,
+                ),
+            )
+            for v in variants
+        ],
+        key=lambda r: r.score.composite,
+        reverse=True,
+    )
+
+    if not ranked or ranked[0].score.composite <= base_score.composite:
+        keep = RankedVariant(variant=Variant(text=original), score=base_score)
+        return keep, [], base_score
+
+    # Apply conciseness bonus: if a candidate is >=10% shorter than original, boost composite
+    try:
+        orig_len = len(original)
+        for r in ranked:
+            if len(r.variant.text) < orig_len * 0.9:
+                r.score.composite *= 1.15
+    except Exception:
+        pass
+
+    # Dynamic alternates cap: respect --num_variants or uncap to all alternates
+    import inspect
+    alt_cap = max(0, int(len(variants) - 1))
+    frame = inspect.currentframe().f_back
+    if frame and "alt_cap" in frame.f_locals:
+        alt_cap = frame.f_locals["alt_cap"]
+    return ranked[0], ranked[1:1+max(0, int(alt_cap))], base_score
 
 # --- REPLACE: improve_tweet to implement the exact I/O contract --------------
 # =========================
@@ -1853,20 +1869,13 @@ def _ml_score_parallel(texts: List[str], followers: Optional[int] = None) -> Dic
 # =========================
 
 # --- Strict Winner Selection: Only promote if composite > original ---
-def choose_winner(
-    original: str,
-    variants: List[Variant],
-    *,
-    followers: Optional[int] = None,
-    scorer: Optional['BaseScorer'] = None,
-    local_scorer_func=None
-) -> Tuple['RankedVariant', List['RankedVariant'], 'Score']:
+def choose_winner(original: str, variants: List[Variant], *, scorer: Optional['BaseScorer'] = None, local_scorer_func=None) -> Tuple['RankedVariant', List['RankedVariant'], 'Score']:
     """
     Scores original + candidates; only promote a variant if it beats the original.
     Returns (winner, alternates_sorted, original_score).
     """
     texts = [original] + [v.text for v in variants]
-
+    followers = globals().get("FOLLOWERS_FOR_RUN", None)
     if local_scorer_func:
         scores = {}
         for t in texts:
@@ -1886,7 +1895,7 @@ def choose_winner(
         )
     else:
         scorer = scorer or MLScorer()
-        parallel_scores = _ml_score_parallel(texts, followers=followers)  # <-- forward followers here
+        parallel_scores = _ml_score_parallel(texts, followers=followers)
         base_ns = parallel_scores[original]
         base_score = Score(likes=base_ns.likes, retweets=base_ns.retweets,
                            replies=base_ns.replies, composite=base_ns.composite)
@@ -1906,11 +1915,9 @@ def choose_winner(
             key=lambda r: r.score.composite,
             reverse=True,
         )
-
     if not ranked or ranked[0].score.composite <= base_score.composite:
         keep = RankedVariant(variant=Variant(text=original), score=base_score)
         return keep, [], base_score
-
     return ranked[0], ranked[1:], base_score
 
 
@@ -1990,12 +1997,7 @@ def improve_tweet(
     filtered_out = [c for c in raw_lines if c not in processed]
     variants = [Variant(text=v) for v in processed]
 
-    winner, alternates, base_score = choose_winner(
-        tweet_text,
-        variants,
-        followers=followers,                # <-- pass it through
-        local_scorer_func=local_scorer_func
-    )
+    winner, alternates, base_score = choose_winner(tweet_text, variants, local_scorer_func=local_scorer_func)
 
     # Persona sampling is disabled; all scoring is Gemini+HTTP scorer only.
 
@@ -2032,26 +2034,6 @@ def improve_tweet(
 # 9) CLI/LOCAL TEST
 # =========================
 if __name__ == "__main__":
-    def estimate_tokens_and_cost(prompt: str, responses: list, model: str = "gemini-pro") -> tuple:
-        """
-        Estimate total tokens and cost for a run.
-        Args:
-            prompt: The prompt string sent to the LLM.
-            responses: List of response strings from the LLM.
-            model: Model name (default: gemini-pro).
-        Returns:
-            (total_tokens, estimated_cost_usd)
-        """
-        # Gemini-pro pricing (as of 2024-06):
-        # Input: $0.00025 per 1K tokens, Output: $0.0005 per 1K tokens
-        # 1 token ≈ 4 chars (rough estimate)
-        input_tokens = max(1, len(prompt) // 4)
-        output_tokens = sum(max(1, len(r) // 4) for r in responses)
-        total_tokens = input_tokens + output_tokens
-        input_cost = input_tokens * 0.00025 / 1000
-        output_cost = output_tokens * 0.0005 / 1000
-        total_cost = input_cost + output_cost
-        return total_tokens, total_cost
     import multiprocessing
     multiprocessing.freeze_support()
     import argparse
@@ -2198,13 +2180,3 @@ if __name__ == "__main__":
             for alt in result["alternates"]:
                 pred = alt.get("predicted", {})
                 print(f"- {alt['text']} (Likes={pred.get('likes','?')}, Retweets={pred.get('retweets','?')}, Replies={pred.get('replies','?')}, Composite={pred.get('composite','?')})")
-
-    # --- Print token/cost estimate for this run ---
-    # Use the prompt and LLM-generated variants (raw_lines)
-    try:
-        prompt_for_cost = prompt if 'prompt' in locals() else args.tweet_text
-        responses_for_cost = raw_lines if 'raw_lines' in locals() else []
-        tokens, cost = estimate_tokens_and_cost(prompt_for_cost, responses_for_cost)
-        print(f"\n[Token/Cost Estimate] Total tokens: {tokens:,} | Estimated cost: ${cost:.5f} (Gemini-pro)\n")
-    except Exception as e:
-        print(f"[Token/Cost Estimate] Could not compute: {e}")

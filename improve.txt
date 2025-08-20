@@ -1,148 +1,117 @@
 from __future__ import annotations
-import os
-import sys
-import re
-import json
-import time
-import logging
-import dataclasses
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-import re, unicodedata
-import os
-import json
-import time
-import random
-import logging
-import dataclasses
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-from types import SimpleNamespace
-from functools import lru_cache
-from datetime import datetime, timezone
-import threading
-
-# --- Wait for scorer liveness (healthz) ---
-def wait_for_scorer_ready(timeout=15, interval=0.5, verbose=False):
-    """Wait for the scorer /healthz endpoint to return 200, up to timeout seconds."""
-    import time
-    import requests
-    start = time.time()
-    url = SCORER_URL
-    if url.endswith("/predict"):
-        url = url.rsplit("/predict", 1)[0]
-    healthz = url.rstrip("/") + "/healthz"
-    while time.time() - start < timeout:
-        try:
-            r = requests.get(healthz, timeout=3)
-            if r.status_code == 200:
-                if verbose:
-                    print(f"[wait_for_scorer_ready] Scorer ready at {healthz}")
-                return True
-        except Exception as e:
-            if verbose:
-                print(f"[wait_for_scorer_ready] Waiting for scorer: {e}")
-        time.sleep(interval)
-    if verbose:
-        print(f"[wait_for_scorer_ready] Timeout waiting for scorer at {healthz}")
-    return False
-
-
 CHAR_LIMIT = 280
 # === Minimal Post-Processing (keep-only) ===
 class MiniPost:
     @staticmethod
-    def clamp_hashtags(text: str, entities: 'Entities', max_new_hashtags: int) -> str:
-        # Stub: just return the text unchanged
-        return text
+    def normalize_spaces(s: str) -> str:
+        s = re.sub(r'[ \t]+', ' ', s)
+        s = re.sub(r'\n{3,}', '\n\n', s)
+        return s.strip()
+
+    @staticmethod
+    def sanitize_basic(text: str, ent: "Entities") -> str:
+        """Reinsert any dropped original entities without inventing new ones."""
+        out = (text or "").strip()
+        # ensure original mentions at the front if missing
+        for m in getattr(ent, "mentions", []) or []:
+            if m and m not in out:
+                out = f"{m} {out}"
+        # ensure original links present (append once)
+        for link in getattr(ent, "links", []) or []:
+            if link and link not in out:
+                out = f"{out} {link}"
+        # ensure original hashtags present (append once)
+        for h in getattr(ent, "hashtags", []) or []:
+            if h and h not in out and len(out) + len(h) + 1 <= CHAR_LIMIT:
+                out = f"{out} {h}"
+        return out
+
+    @staticmethod
+    def clamp_hashtags(text: str, ent: "Entities", max_new: int) -> str:
+        """Keep all original hashtags; allow at most `max_new` new ones (drop the rest)."""
+        orig = {h.lower() for h in getattr(ent, "hashtags", []) or []}
+        toks = text.split()
+        kept, new_seen = [], set()
+        allowed_new = max(0, int(max_new))
+        for t in toks:
+            if t.startswith("#"):
+                low = t.lower()
+                if low in orig:
+                    kept.append(t)
+                else:
+                    if len(new_seen) < allowed_new and low not in new_seen:
+                        kept.append(t); new_seen.add(low)
+                    # else drop extra new tag
+            else:
+                kept.append(t)
+        return " ".join(kept).strip()
+
     @staticmethod
     def limit_emojis(text: str, max_emojis: int) -> str:
-        # Stub: just return the text unchanged
-        return text
-    @staticmethod
-    def ensure_char_limit(text: str, limit: int) -> str:
-        # Stub: return text truncated to limit
-        return text[:limit]
-    @staticmethod
-    def dedupe(texts: list) -> list:
-        # Stub: remove duplicates, preserve order
-        seen = set()
-        result = []
-        for t in texts:
-            if t not in seen:
-                seen.add(t)
-                result.append(t)
-        return result
-    @staticmethod
-    def sanitize_basic(s: str, entities: 'Entities') -> str:
-        s = s.strip()
-        s = re.sub(r'^\s*(?:improve\s+this\s+tweet[:\-]?)\s*', '', s, flags=re.I)
-        s = re.sub(r'\(variant\s*#?\d+\)\s*$', '', s, flags=re.I)
-        return s
-    @staticmethod
-    def batch(original: str, candidates: list, entities: 'Entities', max_new_hashtags: int, max_emojis: int, limit: int) -> list:
-        # Stub: just return the candidates unchanged
-        return candidates
-    @staticmethod
-    def normalize_spaces(s: str) -> str:
-        # Stub: collapse multiple spaces
-        return ' '.join(s.split())
-        # Truncate to limit, preserving whole words
-        if len(text) <= limit:
+        if count_emojis(text) <= max_emojis:
             return text
-        return text[:limit].rsplit(' ', 1)[0]
+        keep = max_emojis
+        def _strip_extra(m):
+            nonlocal keep
+            if keep > 0:
+                keep -= 1
+                return m.group(0)
+            return ""
+        return EMOJI_RE.sub(_strip_extra, text)
+
+    @staticmethod
+    def ensure_char_limit(text: str, limit: int = CHAR_LIMIT) -> str:
+        return _smart_truncate(text, limit=limit)
+
     @staticmethod
     def dedupe(texts: List[str]) -> List[str]:
-        seen = set()
-        out = []
+        seen, out = set(), []
         for t in texts:
-            key = re.sub(r'\W+', '', t.lower())
-            if key in seen:
+            key = re.sub(r'\W+', '', (t or "").lower())
+            if key in seen: 
                 continue
-            seen.add(key)
-            out.append(t)
+            seen.add(key); out.append(t)
         return out
+
     @staticmethod
-    def sanitize_basic(s: str, entities: 'Entities') -> str:
-        s = s.strip()
-        # strip artifacty prompts/suffixes that break guardrails
-        s = re.sub(r'^\s*(?:improve\s+this\s+tweet[:\-]?)\s*', '', s, flags=re.I)
-        s = re.sub(r'\s*\(variant\s*#?\d+\)\s*$', '', s, flags=re.I)
-        return s
-    @staticmethod
-    def batch(original: str, candidates: List[str], entities: 'Entities', max_new_hashtags: int, max_emojis: int, limit: int) -> List[str]:
+    def batch(
+        *,
+        original: str,
+        candidates: List[str],
+        entities: "Entities",
+        max_new_hashtags: int,
+        max_emojis: int,
+        limit: int
+    ) -> List[str]:
+        """Minimal, deterministic clean-up with only hard constraints."""
         out = []
         for c in candidates:
             if not c or not c.strip():
                 continue
             s = _strip_quote_bullets(c)
             s = MiniPost.sanitize_basic(s, entities)
+
+            # Reject if it introduces new links/mentions/numeric claims/years
             if not _no_new_claim_risk(original, s):
                 continue
+
             s = MiniPost.clamp_hashtags(s, entities, max_new_hashtags)
             s = MiniPost.limit_emojis(s, max_emojis)
             s = MiniPost.ensure_char_limit(s, limit)
             s = MiniPost.normalize_spaces(s)
             out.append(s)
+
         out = MiniPost.dedupe(out)
+
+        # Always return at least one candidate
         if not out:
             fallback = MiniPost.sanitize_basic(original, entities)
             fallback = MiniPost.clamp_hashtags(fallback, entities, max_new_hashtags)
             fallback = MiniPost.limit_emojis(fallback, max_emojis)
             fallback = MiniPost.ensure_char_limit(fallback, limit)
             out = [MiniPost.normalize_spaces(fallback)]
+
         return out
-    @staticmethod
-    def normalize_spaces(s: str) -> str:
-        # Collapse spaces/tabs, but keep bullets/newlines
-        s = re.sub(r'[ \t]+', ' ', s)
-        s = re.sub(r'\n{3,}', '\n\n', s)
-        return s.strip()
 # improve.py — skeleton (v0)
 # Purpose: take a tweet, generate 5–7 improved variants with Gemini, score them
 # with your prediction stack/personas, and return the best + context.
@@ -158,51 +127,101 @@ class MiniPost:
 # export ALLOW_CTA=true
 
  # --- Consolidated imports ---
+import re, unicodedata
+import os
+import json
+import time
+import random
+import logging
+import dataclasses
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from types import SimpleNamespace
+from functools import lru_cache
+from datetime import datetime, timezone
+import threading
+# --- ADD: scorer warmup utility ---
+def wait_for_scorer_ready(timeout=15, interval=0.5, verbose=True):
+    """
+    Ping the scorer API until it responds, or until timeout (in seconds).
+    Returns True if ready, False if not.
+    """
+    if not SCORER_URL:
+        return False
+    import time, requests, urllib.parse
+    base = SCORER_URL
+    # strip /predict if present
+    if base.endswith("/predict"):
+        base = base.rsplit("/predict", 1)[0]
+    url = urllib.parse.urljoin(base + "/", "healthz")
+    deadline = time.time() + timeout
+    last_err = None
+    while time.time() < deadline:
+        try:
+            r = requests.get(url, timeout=1.5)
+            if r.status_code == 200:
+                if verbose: print(f"[improve.py] Scorer API ready at {url}")
+                return True
+        except Exception as e:
+            last_err = e
+            if verbose: print(f"[improve.py] Waiting for scorer API at {url}... ({e})")
+        time.sleep(interval)
+    if verbose: print(f"[improve.py] Scorer API not ready after {timeout}s: {last_err}")
+    return False
+
+# optional HTTP scorer settings (useful when running a separate scorer service)
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
-# --- STRICT DEPENDENCIES AT TOP ---
 
+# Define retries for HTTPAdapter
+retries = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+)
+# Increase HTTPAdapter pool size to avoid connection pool full errors
+adapter = HTTPAdapter(max_retries=retries, pool_connections=100, pool_maxsize=100)
+_SESSION = requests.Session()
+_SESSION.mount("http://", adapter)
+_SESSION.mount("https://", adapter)
 
-# --- SCORER_URL: default to http://127.0.0.1:8001/predict to match api.py ---
-SCORER_URL = os.getenv("SCORER_URL", "http://127.0.0.1:8001/predict")
-if not SCORER_URL:
-    print("[improve.py] ERROR: SCORER_URL environment variable must be set.")
-    sys.exit(1)
-
-# --- If /healthz fails to return 200, print error and exit ---
-import urllib.parse
-base = SCORER_URL
-if base.endswith("/predict"):
-    base = base.rsplit("/predict", 1)[0]
-url = urllib.parse.urljoin(base + "/", "healthz")
-try:
-    r = requests.get(url, timeout=30)
-    if r.status_code != 200:
-        print(f"[improve.py] ERROR: Scorer API /healthz check failed (status {r.status_code}) at {url}")
-        sys.exit(1)
-except Exception as e:
-    print(f"[improve.py] ERROR: Scorer API /healthz check failed at {url}: {e}")
-    sys.exit(1)
-
-
-
+SCORER_URL = os.getenv("SCORER_URL")  # e.g., http://localhost:8000/predict
 SCORER_TIMEOUT = float(os.getenv("SCORER_TIMEOUT", "8"))
 
-# --- ADD: wait_for_scorer_ready function for scorer liveness check ---
-import time
-import requests
+# Optional ELO endpoint (only if you have it)
+SCORER_ELO_URL = os.getenv("SCORER_ELO_URL")  # e.g., http://localhost:8000/elo
 
 # --- ADD: config loader with precedence (ENV > JSON > defaults) ---
 
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None: return default
+    return v.lower() in {"1","true","yes","y","on"}
+
+def _env_float(name: str, default: float) -> float:
+    try: return float(os.getenv(name, default))
+    except: return default
+
+def _env_int(name: str, default: int) -> int:
+    try: return int(os.getenv(name, default))
+    except: return default
 
 @dataclass(frozen=True)
 class Settings:
     NUM_VARIANTS: int = 30                     # Default is now 30
+    SCORING_MODE: str = "blend"                # "ml" | "elo" | "blend"
     ALPHA_RETWEETS: float = 2.0
     BETA_REPLIES: float = 1.0
     MAX_NEW_HASHTAGS: int = 1
     MAX_EMOJIS: int = 2
     ALLOW_CTA: bool = True
+    PERSONA_SAMPLE_SIZE: int = 1000            # if sub-sampling for Elo
     TRENDING_HASHTAGS_ENABLED: bool = True
     GEMINI_MODEL: str = "models/gemini-2.5-flash"  # Gemini 2.5 Flash
     TEMPERATURE: float = 0.85
@@ -224,73 +243,27 @@ def load_settings(path: str = "config.json") -> Settings:
     except Exception as e:
         print(f"⚠️ config.json load error: {e} (using defaults/env)")
 
-    # 3) overlay ENV (wins) - use inline helpers since _env_* were removed
-    def env_int(name, default):
-        v = os.getenv(name)
-        return int(v) if v is not None else default
-    def env_float(name, default):
-        v = os.getenv(name)
-        return float(v) if v is not None else default
-    def env_bool(name, default):
-        v = os.getenv(name)
-        return v.lower() in {"1","true","yes","y","on"} if v is not None else default
-
-    base["NUM_VARIANTS"]            = env_int("NUM_VARIANTS", base["NUM_VARIANTS"])
-    base["ALPHA_RETWEETS"]          = env_float("ALPHA_RETWEETS", base["ALPHA_RETWEETS"])
-    base["BETA_REPLIES"]            = env_float("BETA_REPLIES", base["BETA_REPLIES"])
-    base["MAX_NEW_HASHTAGS"]        = env_int("MAX_NEW_HASHTAGS", base["MAX_NEW_HASHTAGS"])
-    base["MAX_EMOJIS"]              = env_int("MAX_EMOJIS", base["MAX_EMOJIS"])
-    base["ALLOW_CTA"]               = env_bool("ALLOW_CTA", base["ALLOW_CTA"])
-    base["TRENDING_HASHTAGS_ENABLED"]= env_bool("TRENDING_HASHTAGS_ENABLED", base["TRENDING_HASHTAGS_ENABLED"])
+    # 3) overlay ENV (wins)
+    base["NUM_VARIANTS"]            = _env_int("NUM_VARIANTS", base["NUM_VARIANTS"])
+    base["SCORING_MODE"]            = os.getenv("SCORING_MODE", base["SCORING_MODE"])
+    base["ALPHA_RETWEETS"]          = _env_float("ALPHA_RETWEETS", base["ALPHA_RETWEETS"])
+    base["BETA_REPLIES"]            = _env_float("BETA_REPLIES", base["BETA_REPLIES"])
+    base["MAX_NEW_HASHTAGS"]        = _env_int("MAX_NEW_HASHTAGS", base["MAX_NEW_HASHTAGS"])
+    base["MAX_EMOJIS"]              = _env_int("MAX_EMOJIS", base["MAX_EMOJIS"])
+    base["ALLOW_CTA"]               = _env_bool("ALLOW_CTA", base["ALLOW_CTA"])
+    base["PERSONA_SAMPLE_SIZE"]     = _env_int("PERSONA_SAMPLE_SIZE", base["PERSONA_SAMPLE_SIZE"])
+    base["TRENDING_HASHTAGS_ENABLED"]= _env_bool("TRENDING_HASHTAGS_ENABLED", base["TRENDING_HASHTAGS_ENABLED"])
     base["GEMINI_MODEL"]            = os.getenv("GEMINI_MODEL", base["GEMINI_MODEL"])
-    base["TEMPERATURE"]             = env_float("TEMPERATURE", base["TEMPERATURE"])
-    base["TIMEOUT"]                 = env_int("TIMEOUT", base["TIMEOUT"])
-    base["RETRIES"]                 = env_int("RETRIES", base["RETRIES"])
-    base["DISABLE_ENGAGEMENT_MECHANICS"] = env_bool("DISABLE_ENGAGEMENT_MECHANICS", base.get("DISABLE_ENGAGEMENT_MECHANICS", True))
+    base["TEMPERATURE"]             = _env_float("TEMPERATURE", base["TEMPERATURE"])
+    base["TIMEOUT"]                 = _env_int("TIMEOUT", base["TIMEOUT"])
+    base["RETRIES"]                 = _env_int("RETRIES", base["RETRIES"])
+    base["DISABLE_ENGAGEMENT_MECHANICS"] = _env_bool("DISABLE_ENGAGEMENT_MECHANICS", base.get("DISABLE_ENGAGEMENT_MECHANICS", True))
 
     return Settings(**base)
 
 
-
-
-
-
-# --- Setup logging before any log usage ---
-LOG_LEVEL = os.getenv("IMPROVE_LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
-log = logging.getLogger("improve")
-
 # single global settings object
 SETTINGS = load_settings()
-
-# --- Make ALPHA_RETWEETS and BETA_REPLIES available globally ---
-ALPHA_RETWEETS = SETTINGS.ALPHA_RETWEETS
-BETA_REPLIES = SETTINGS.BETA_REPLIES
-
-# --- Print/log SCORER_URL at startup ---
-print(f"[improve.py] SCORER_URL = {os.getenv('SCORER_URL')!r}")
-log.info(f"[improve.py] SCORER_URL = {os.getenv('SCORER_URL')!r}")
-
-# --- Define GEN_RETRIES for legacy compatibility ---
-GEN_RETRIES = SETTINGS.RETRIES
-
-
-# --- GEMINI_MODEL and TEMPERATURE are now referenced from SETTINGS ---
-
-# --- ADD: fallback deterministic_variants function ---
-def deterministic_variants(text: str, n: int) -> List[str]:
-    base = text.strip()
-    return [f"{base} (variant #{i+1})" for i in range(n)]
-
-# --- Ensure all LLM client instantiations use SETTINGS.TEMPERATURE and SETTINGS.GEMINI_MODEL ---
-# Example usage (update all similar occurrences):
-# llm = GeminiClient(
-#     api_key=GEMINI_API_KEY,
-#     model=SETTINGS.GEMINI_MODEL,
-#     temperature=SETTINGS.TEMPERATURE,
-#     timeout=SETTINGS.TIMEOUT,
-#     retries=GEN_RETRIES,
-# )
 
 
 # --- Make HF token and persistent cache available to huggingface_hub / transformers ---
@@ -331,9 +304,44 @@ def predownload_hf_models(model_list):
 # predownload_hf_models(PRELOAD_MODELS)
 
 
+# --- WIRE SETTINGS INTO EXISTING KNOBS ---
+NUM_VARIANTS_DEFAULT   = SETTINGS.NUM_VARIANTS  # Will be 30 by default
+# FORCE BLEND MODE ALWAYS
+SCORING_MODE_DEFAULT   = "blend"  # Always use blend mode, ignore config/env
+BLEND_W_ML  = 0.70
+BLEND_W_ELO = 0.30
+ALPHA_RETWEETS         = SETTINGS.ALPHA_RETWEETS
+BETA_REPLIES           = SETTINGS.BETA_REPLIES
+MAX_NEW_HASHTAGS       = SETTINGS.MAX_NEW_HASHTAGS
+MAX_EMOJIS_GENERAL     = SETTINGS.MAX_EMOJIS
+ALLOW_CTA_DEFAULT      = SETTINGS.ALLOW_CTA
+PERSONA_SAMPLE_SIZE    = SETTINGS.PERSONA_SAMPLE_SIZE
+TRENDING_ENABLED       = SETTINGS.TRENDING_HASHTAGS_ENABLED
+GEMINI_MODEL           = SETTINGS.GEMINI_MODEL
+TEMPERATURE            = SETTINGS.TEMPERATURE
+GEN_TIMEOUT_S          = SETTINGS.TIMEOUT
+GEN_RETRIES            = SETTINGS.RETRIES
 
-# --- REMOVE: persona, Elo, blend, deterministic_variants, local/heuristic scoring ---
-# All code and references to persona, Elo, blend, deterministic_variants, and local/heuristic scoring have been removed for strict dependency compliance.
+# --- ADD: parallelism knobs ---
+# PERFORMANCE OPTIMIZATIONS:
+# - ProcessPool for CPU-bound ML scoring (8-16 workers)  
+# - ThreadPool for I/O bound tasks (12 workers)
+# - LRU cache for repeated text features (sentiment, hashtags, length)
+# - TTL cache for trending hashtags (15 min)
+# - Persona sampling cap (≤1000) for Elo performance
+ML_POOL_SIZE = int(os.getenv("ML_POOL_SIZE", "8"))       # 8–16 recommended
+THREAD_POOL_SMALL = int(os.getenv("THREAD_POOL_SMALL", "12"))
+
+# Dedicated pools (lazy init for safety on Windows/notebooks)
+ML_EXEC = None  # type: Optional[ProcessPoolExecutor]
+AUX_EXEC = ThreadPoolExecutor(max_workers=THREAD_POOL_SMALL)  # minor parallel IO/cleanup
+
+def _get_ml_exec():
+    global ML_EXEC
+    if ML_EXEC is None:
+        from concurrent.futures import ProcessPoolExecutor
+        ML_EXEC = ProcessPoolExecutor(max_workers=ML_POOL_SIZE)
+    return ML_EXEC
 
 # =========================
 # 0) CONFIG & CONSTANTS
@@ -350,22 +358,15 @@ if not GEMINI_API_KEY:
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY missing. Set it in env or config.json.")
 
-
-
 CHAR_LIMIT     = 280
-
-# --- ADD: NUM_VARIANTS_DEFAULT for CLI and function defaults ---
-try:
-    NUM_VARIANTS_DEFAULT = SETTINGS.NUM_VARIANTS
-except Exception:
-    NUM_VARIANTS_DEFAULT = 7  # fallback if SETTINGS is not available
 
 # Updated emoji limits by type
 MAX_EMOJIS_NEWS = 1
-# General emoji limit (fallback for non-news types)
-MAX_EMOJIS_GENERAL = 1
-# Max new hashtags (default/fallback)
-MAX_NEW_HASHTAGS = 1
+
+# --- ADD: blend weights & composite weights ---
+BLEND_W_ML  = 0.70
+BLEND_W_ELO = 0.30
+ELO_PERSONA_CAP = PERSONA_SAMPLE_SIZE  # keep <=1000 for speed
 
 LOG_LEVEL = os.getenv("IMPROVE_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -631,7 +632,54 @@ def precheck_and_parse(tweet_text: str):
     return t, analysis
 
 
+# --- Real scoring stack selection (HTTP-first, then local persona_engine) ---
+_real_run_elo_tournament = None
+ENGINE = None
 
+if SCORER_URL:
+    _SCORING_STACK_AVAILABLE = True
+    log.info("Using HTTP scorer at %s", SCORER_URL)
+else:
+    try:
+        from persona_engine import EnhancedPersonaEngine, run_elo_tournament as _real_run_elo_tournament
+        ENGINE = EnhancedPersonaEngine()  # or EnhancedPersonaEngine.from_config("config.json") if you have that
+        _SCORING_STACK_AVAILABLE = True
+        log.info("Using local persona_engine scorer.")
+    except Exception as e:
+        _SCORING_STACK_AVAILABLE = False
+        log.warning("persona_engine not available; using fallback heuristic scorer. (%s)", e)
+
+
+# Use persona_engine's loader to ensure correct Persona structure
+from persona_engine import load_personas
+
+# Wrapper that calls the real Elo if present, else falls back
+def run_elo_tournament(texts: List[str], personas: List[Dict]) -> List[Dict]:
+    """
+    Returns a list of dicts like: [{"text": ..., "elo_score": float}, ...] ordered best->worst.
+    """
+    # Prefer HTTP Elo API if provided
+    if SCORER_ELO_URL:
+        try:
+            payload = {"texts": texts, "personas": personas}
+            r = requests.post(SCORER_ELO_URL, json=payload, timeout=SCORER_TIMEOUT)
+            r.raise_for_status()
+            data = r.json() if hasattr(r, "json") else []
+            # Validate minimal shape
+            if isinstance(data, list) and data and "text" in data[0]:
+                return data
+            log.warning("Elo API returned unexpected shape; falling back.")
+        except Exception as e:
+            log.warning("Elo API error: %s; falling back.", e)
+
+    # Else use local function if present
+    if _real_run_elo_tournament is not None:
+        return _real_run_elo_tournament(texts, personas)
+
+    # Last-resort fallback: sort by ML score
+    sc = MLScorer()
+    ranked = sorted(texts, key=lambda t: sc.score(t).composite, reverse=True)
+    return [{"text": t, "elo_score": 1000 + (len(ranked) - i - 1) * 10} for i, t in enumerate(ranked)]
 
 # =========================
 # 1) DATA MODELS
@@ -681,21 +729,7 @@ class RankedVariant:
 # =========================
 class TweetAnalyzer:
     @staticmethod
-    def analyze(text: str):
-        # Minimal implementation: returns an Analysis object with language and entities
-        lang = _detect_language_heuristic(text)
-        entities = extract_entities(text)
-        # You can expand this as needed for more features
-        return Analysis(
-            tweet_type="general",  # or use detect_type if you want
-            has_link=bool(entities.links),
-            has_question="?" in text,
-            language=lang,
-            entities=entities
-        )
-
-    @staticmethod
-    def detect_type(text: str, ent: 'Entities') -> str:
+    def detect_type(text: str, ent: Entities) -> str:
         t = text.lower()
         if "breaking" in t or re.search(r'\b\d{4}\b', t) or ent.links:
             return "news"
@@ -705,12 +739,26 @@ class TweetAnalyzer:
             return "personal"
         return "general"
 
+    @staticmethod
+    def detect_language(text: str) -> str:
+        # Use the same heuristic as elsewhere for consistency
+        return _detect_language_heuristic(text)
+
+    @classmethod
+    def analyze(cls, text: str) -> Analysis:
+        ent = extract_entities(text)
+        return Analysis(
+            tweet_type=cls.detect_type(text, ent),
+            has_link=bool(ent.links),
+            has_question=("?" in text),
+            language=cls.detect_language(text),
+            entities=ent,
+        )
 
 # --- REPLACE: PromptBuilder.build to use a single rich, numbered-output prompt ---
 class PromptBuilder:
     @staticmethod
     def build(text: str, analysis, n: int = 30) -> str:
-        # Build a rich JSON prompt for Gemini
         kind = getattr(analysis, "tweet_type", None) or "general"
         cfg  = get_style_constraints(kind)
         ent  = analysis.entities
@@ -907,60 +955,75 @@ class PromptBuilder:
 # 4) GEMINI CLIENT (real)
 # =========================
 class GeminiClient:
-
     def __init__(self, api_key: str, model: str, temperature: float, timeout: int = 20, retries: int = 2):
+        try:
+            import google.generativeai as genai
+        except ImportError:
+            raise RuntimeError("google-generativeai not installed. Run: pip install google-generativeai")
+        self._genai = genai
         self.api_key = api_key
-        self.model = model
+        self.model_name = model
         self.temperature = temperature
         self.timeout = timeout
         self.retries = retries
+
         if not self.api_key:
-            raise RuntimeError("GEMINI_API_KEY missing")
+            raise RuntimeError("GEMINI_API_KEY not set")
 
-    def _endpoint(self) -> str:
-        # REST v1beta generateContent
-        return f"https://generativelanguage.googleapis.com/v1beta/{self.model}:generateContent?key={self.api_key}"
+        genai.configure(api_key=self.api_key)
+        self._model = genai.GenerativeModel(self.model_name)
 
-    def generate_variants(self, prompt: str, n: int, temperature: Optional[float] = None) -> List[str]:
-        body = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {
-                            "text": "You are an expert tweet editor. Follow the JSON instructions strictly.\n\n" + prompt
-                        }
-                    ],
-                }
-            ],
-            "generationConfig": {
-                "temperature": float(temperature if temperature is not None else self.temperature),
-                "maxOutputTokens": 1024,
-                "responseMimeType": "application/json",
-            },
-        }
+    def generate_variants(self, prompt: str, n: int, temperature: Optional[float] = None) -> str:
+        """
+        Generate variants using Gemini. Robustly handle finish_reason 2 (model stopped), empty, or malformed responses.
+        Log finish_reason and error details. Fallback to deterministic variants if no valid output is found.
+        """
+        import logging
+        actual_temp = temperature if temperature is not None else self.temperature
         last_err = None
-        for attempt in range(1, self.retries + 2):
+        max_output_tokens = min(4096, 128 + n * 80)
+        for attempt in range(max(1, self.retries)):
             try:
-                r = requests.post(self._endpoint(), json=body, timeout=self.timeout)
-                if r.status_code != 200:
-                    raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:200]}")
-                data = r.json()
-                text = (
-                    data.get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text", "")
+                resp = self._model.generate_content(
+                    prompt,
+                    generation_config=self._genai.GenerationConfig(
+                        temperature=actual_temp,
+                        max_output_tokens=max_output_tokens,
+                    )
                 )
-                variants = parse_gemini_variants(text, expected=n)
-                if not variants:
-                    raise ValueError("Empty variants from model")
-                return variants[:n]
+                # Prefer .text if present and non-empty
+                if hasattr(resp, "text") and resp.text:
+                    return resp.text
+                # Fallback: try to extract from candidates
+                candidates = getattr(resp, "candidates", None)
+                if candidates and isinstance(candidates, list):
+                    for cand in candidates:
+                        finish_reason = getattr(cand, "finish_reason", None)
+                        # finish_reason 2 = STOP, 1 = SAFETY, 0 = FINISHED
+                        if finish_reason not in (0, None):
+                            logging.warning(f"[Gemini] LLM generation finish_reason={finish_reason} (not finished). Candidate: {getattr(cand, 'content', None)}")
+                        content = getattr(cand, "content", None)
+                        # Try .parts (list of Part objects with .text)
+                        if content and hasattr(content, "parts"):
+                            parts = [getattr(p, "text", "") for p in content.parts if getattr(p, "text", None)]
+                            if parts:
+                                return "\n".join(parts)
+                        # Try .text directly
+                        if hasattr(content, "text") and content.text:
+                            return content.text
+                    # If all candidates exhausted, log and break
+                    logging.error(f"[Gemini] No valid candidates in LLM response. Candidates: {candidates}")
+                else:
+                    logging.error(f"[Gemini] LLM response missing candidates: {resp}")
+                # If we reach here, no valid output found
+                raise RuntimeError("Empty or invalid Gemini response (no usable text/candidates)")
             except Exception as e:
                 last_err = e
-                log.warning("Gemini attempt %d failed: %s", attempt, e)
-                time.sleep(0.5 * attempt)
-        raise RuntimeError(f"Gemini failed after retries: {last_err}")
+                logging.warning(f"[Gemini] LLM generation attempt {attempt+1} failed: {e}")
+                time.sleep(0.4)
+        # All retries failed; log and raise
+        logging.error(f"[Gemini] All LLM generation attempts failed. Last error: {last_err}")
+        raise last_err
 
 
 # =========================
@@ -969,7 +1032,6 @@ class GeminiClient:
 class PostProcessor:
     @staticmethod
     def normalize_spaces(s: str) -> str:
-        pass
         # Collapse spaces/tabs, but keep bullets/newlines
         s = re.sub(r'[ \t]+', ' ', s)
         s = re.sub(r'\n{3,}', '\n\n', s)
@@ -1375,8 +1437,8 @@ def apply_type_style(original: str, text: str, kind: str) -> Tuple[str, bool]:
 # 6) SCORERS (stubs)
 # =========================
 def _normalize_engine_output(data):
-
     """Return (likes, retweets, replies) as floats from various engine output shapes."""
+    # pydantic/dataclass/obj → dict
     if hasattr(data, "dict"):
         data = data.dict()
     if isinstance(data, dict):
@@ -1386,78 +1448,145 @@ def _normalize_engine_output(data):
         return (likes, retweets, replies)
     raise TypeError(f"Unsupported engine output shape: {type(data)} {repr(data)[:120]}")
 
-
-# --- Minimal MLScorer implementation using FastAPI /predict endpoint ---
-
-import requests
-import os
-import logging
-from types import SimpleNamespace
-
-# --- Define a global requests.Session for connection reuse ---
-_SESSION = requests.Session()
-
-class MLScorer:
-    """
-    MLScorer: Calls the FastAPI /predict endpoint to get likes, retweets, replies for a tweet.
-    Returns a Score object as expected by the rest of the code.
-    """
-    def __init__(self, scorer_url: str = None, timeout: float = None):
-        self.scorer_url = scorer_url or os.getenv("SCORER_URL")
-        self.timeout = timeout or float(os.getenv("SCORER_TIMEOUT", "8"))
-        if not self.scorer_url:
-            raise RuntimeError("SCORER_URL must be set for MLScorer.")
-        if self.scorer_url.endswith("/predict"):
-            self.scorer_url = self.scorer_url
-        else:
-            self.scorer_url = self.scorer_url.rstrip("/") + "/predict"
-
-    def score(self, text: str, followers: int = None) -> 'Score':
-        payload = {"text": text, "return_details": False}
-        if followers is not None:
-            payload["followers"] = int(followers)
-        log.info(f"[MLScorer] Calling /predict at {self.scorer_url} with followers={followers}, text[:40]='{text[:40]}'")
-        try:
-            resp = requests.post(self.scorer_url, json=payload, timeout=self.timeout)
-            log.info(f"[MLScorer] /predict status: {resp.status_code}")
-            resp.raise_for_status()
-            d = resp.json()
-            log.info(f"[MLScorer] /predict response: {d}")
-            likes = float(d.get("likes", 0.0))
-            rts = float(d.get("retweets", d.get("rts", 0.0)))
-            reps = float(d.get("replies", 0.0))
-            comp = likes + ALPHA_RETWEETS * rts + BETA_REPLIES * reps
-            log.info(f"[MLScorer] Scored: likes={likes}, retweets={rts}, replies={reps}, composite={comp}")
-            return Score(likes=likes, retweets=rts, replies=reps, composite=comp, details={"raw": d})
-        except Exception as e:
-            log.error(f"[MLScorer] Error scoring text: {e}")
-            return Score(likes=0.0, retweets=0.0, replies=0.0, composite=0.0, details={"error": str(e)})
-
 class BaseScorer:
     def score(self, text: str) -> Score:
         raise NotImplementedError
 
+class MLScorer(BaseScorer):
+    _scorer_warmed_up = False
+    _scorer_warmup_lock = threading.Lock()
+
     def __init__(self, alpha: float = None, beta: float = None, followers: Optional[int] = None):
+        # TODO: wire your EnhancedPersonaEngine.predict_virality here
+        self.ready = _SCORING_STACK_AVAILABLE
         self.alpha = alpha or ALPHA_RETWEETS
         self.beta = beta or BETA_REPLIES
         self.followers = followers
 
+        # Warm up scorer only once per process
+        if SCORER_URL and not MLScorer._scorer_warmed_up:
+            with MLScorer._scorer_warmup_lock:
+                if not MLScorer._scorer_warmed_up:
+                    wait_for_scorer_ready(timeout=15, interval=0.5, verbose=True)
+                    MLScorer._scorer_warmed_up = True
+
     def score(self, text: str, followers: Optional[int] = None) -> Score:
-        payload = {"text": text}
-        if followers is not None:
-            payload["followers"] = int(followers)
-        r = _SESSION.post(SCORER_URL, json=payload, timeout=SCORER_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        likes = float(data.get("likes", 0.0))
-        rts = float(data.get("retweets", data.get("rts", 0.0)))
-        reps = float(data.get("replies", 0.0))
-        comp = likes + self.alpha * rts + self.beta * reps
-        return Score(likes=likes, retweets=rts, replies=reps, composite=comp, details={"raw": data})
+        use_followers = followers if followers is not None else self.followers or globals().get("FOLLOWERS_FOR_RUN", None)
+        # 1) HTTP scorer takes precedence if set
+        if SCORER_URL:
+            payload = {"text": text}
+            if use_followers is not None:
+                payload["followers"] = int(use_followers)
+            last_err = None
+            for _ in range(2):
+                try:
+                    r = _SESSION.post(SCORER_URL, json=payload, timeout=SCORER_TIMEOUT)
+                    r.raise_for_status()
+                    data = r.json()
+                    likes = float(data.get("likes", 0.0))
+                    rts   = float(data.get("retweets", data.get("rts", 0.0)))
+                    reps  = float(data.get("replies", 0.0))
+                    comp  = likes + self.alpha * rts + self.beta * reps
+                    return Score(likes=likes, retweets=rts, replies=reps, composite=comp, details={"raw": data})
+                except Exception as e:
+                    last_err = e
+                    log.warning("Scorer API error: %s", e)
+                    time.sleep(0.25)
+            log.error("Scorer API failed after retries: %s. Falling back.", last_err)
 
+        # 2) Local persona_engine (your repo)
+        if ENGINE is not None:
+            try:
+                for method_name in ("predict_virality", "predict", "score"):
+                    fn = getattr(ENGINE, method_name, None)
+                    if not callable(fn):
+                        continue
+                    raw = fn(text)
+                    # helpful once: log the shape
+                    log.debug("persona_engine output type=%s preview=%r", type(raw), raw if isinstance(raw, (int,float)) else (list(raw.keys()) if isinstance(raw, dict) else raw))
+                    likes, rts, reps = _normalize_engine_output(raw)
+                    comp = likes + self.alpha * rts + self.beta * reps
+                    return Score(likes=likes, retweets=rts, replies=reps, composite=comp, details={"raw": raw})
+            except Exception as e:
+                log.warning("persona_engine scoring failed; using heuristic fallback. (%s)", e)
 
+        # 3) Final fallback heuristic
+        hook_bonus = 0.2 if any(x in text.lower() for x in ["breaking", "new", "just in", "thread"]) else 0.0
+        q_bonus    = 0.15 if "?" in text else 0.0
+        len_bonus  = 0.2  if 80 <= len(text) <= 180 else 0.0
+        comp = 1.0 + hook_bonus + q_bonus + len_bonus
+        return Score(likes=comp, retweets=comp*0.35, replies=comp*0.25, composite=comp)
 
+class EloScorer(BaseScorer):
+    def __init__(self):
+        self.ready = _SCORING_STACK_AVAILABLE
 
+    def score_many(self, variants: List[str]) -> List[Score]:
+        if not self.ready:
+            # simple per-text heuristic for skeleton
+            return [MLScorer().score(v) for v in variants]
+        # TODO: call run_elo_tournament([...]) and map back to Score per variant
+        # return [...]
+        return [Score(composite=1.0) for _ in variants]
+
+# --- ADD: deterministic variants (fallback if LLM fails) ---
+import hashlib
+RNG_SALT = "improve.py-fallback-v1"
+
+def _seed_from(text: str) -> int:
+    h = hashlib.sha256((RNG_SALT + text).encode("utf-8")).hexdigest()
+    return int(h[:8], 16)
+
+def deterministic_variants(original: str, n: int) -> List[str]:
+    rnd = random.Random(_seed_from(original))
+    base = original.strip()
+
+    personal_terms = re.findall(r'\b(twin|friend|fam|bro|sis|buddy)\b', original.lower())
+    base_term = (personal_terms[0] + '.') if personal_terms else ""
+
+    def add_cta(t):
+        CTAS = [
+            f"Stay positive {base_term}",
+            f"Keep smiling {base_term}",
+            f"Sending good vibes {base_term}",
+            f"Thoughts {base_term}",
+        ]
+        cta = rnd.choice(CTAS)
+        sep = " " if t and t[-1].isalnum() else ""
+        return f"{t}{sep}{cta}"
+
+    def stat_first(t):
+        urls = LINK_RE.findall(t)
+        safe = LINK_RE.sub("__URL__", t)
+        # Improved regex: captures optional $/currency, keeps %/k/K, etc.
+        m = re.search(r'(\$?\d[\d,\.\'%kK]*\b.*?)([.!?])', safe)
+        if not m:
+            return t
+        chunk = m.group(1).replace("__URL__", urls[0] if urls else "")
+        # avoid duplicating the same clause
+        if chunk and chunk.lower() in t.lower():
+            return t
+        return (chunk.strip() + " — " + t).strip()
+
+    def tighten(t):
+        return tighten_to_limit(t, limit=260)
+
+    def punchy_open(t):
+        OPENERS = ["Hot take:", "Real talk:", "Quick win:", "Underrated:", "Reminder:"]
+        return f"{rnd.choice(OPENERS)} {t}"
+
+    def emoji_trim(t):
+        return PostProcessor.limit_emojis(t, max_emojis=1)
+
+    strategies = [add_cta, stat_first, tighten, punchy_open, emoji_trim]
+    outs = set()
+    for _ in range(max(2, n) * 2):
+        t = base
+        for _ in range(rnd.randint(1, 3)):
+            t = rnd.choice(strategies)(t)
+        outs.add(PostProcessor.sanitize(t, Entities.from_text(base), original=original))
+    # ensure size n (dedupe later anyway)
+    return list(outs)[:n]
 
 # --- ADD: helpers for key-fact preservation and constraint filtering ---------
 
@@ -1658,15 +1787,23 @@ def enforce_length_variety(variants: List[str], original: str, entities: Entitie
     return out
 
 def dedupe_near(lines: List[str], thresh: int = 92) -> List[str]:
-    kept: List[str] = []
-    seen = set()
+    """Dedupe using fuzzy matching. For now, use simple heuristic since fuzzywuzzy not imported."""
+    kept = []
     for s in lines:
-        key = re.sub(r'\W+', '', s.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        kept.append(s)
+        # Simple similarity check - count common words
+        if not any(_simple_similarity(s, k) >= thresh for k in kept):
+            kept.append(s)
     return kept
+
+def _simple_similarity(a: str, b: str) -> int:
+    """Simple word-based similarity as fallback for fuzzy matching."""
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return 0
+    intersection = len(words_a & words_b)
+    union = len(words_a | words_b)
+    return int((intersection / union) * 100) if union > 0 else 0
 
 def ensure_diversity(cands: List[str]) -> List[str]:
     if not cands:
@@ -1697,7 +1834,19 @@ def maybe_add_trending_hashtag(s: str, trending: Optional[set]) -> str:
             return (s + " " + token).strip()
     return s
 
+# --- ADD: Persona sampling and scoring functions -------------------------------
 
+PERSONA_SAMPLE_MAX = int(os.getenv("PERSONA_SAMPLE_MAX", "1000"))
+
+def _sample_personas(personas, text: str, k: int = PERSONA_SAMPLE_MAX):
+    if len(personas) <= k:
+        return personas
+    return _sample_personas_with_seed(personas, text, k)
+
+def _sample_personas_with_seed(personas, text: str, k: int = PERSONA_SAMPLE_MAX, seed: Optional[int] = None):
+    use_seed = seed if seed is not None else int(hashlib.md5(text.encode("utf-8")).hexdigest()[:8], 16)
+    rnd = random.Random(use_seed)
+    return rnd.sample(personas, k)
 
 # --- ADD: light hook/clarity rubric for tie-breaks --------------------------
 
@@ -1747,10 +1896,66 @@ def rank_with_elo(original: str, texts: List[str], personas: List[Dict]):
     results = run_elo_tournament(pack, personas)  # you already have this
     # Map back into RankedVariant-like objects
     ranked = []
-    raise NotImplementedError("Persona/Elo scoring is disabled. All scoring is Gemini+HTTP scorer only.")
+    for r in results:
+        rv = RankedVariant(
+            variant=Variant(text=r["text"]),
+            score=Score(  # fill composite from Elo (normalize later if needed)
+                likes=0.0, retweets=0.0, replies=0.0, composite=r.get("elo_score", r.get("elo", 1000.0))
+            )
+        )
+        ranked.append(rv)
+    # Ensure best is first; drop the original from alternates presentation later if needed
+    ranked = sorted(ranked, key=lambda x: x.score.composite, reverse=True)
+    return ranked, base_score
 
 def blended_rank(original: str, variants: List[str], scorer_ml: "MLScorer", personas: List[Dict]):
-    raise NotImplementedError("Blended scoring is disabled. All scoring is Gemini+HTTP scorer only.")
+    # 1) ML scores (batch original and variants)
+    texts = [original] + variants
+    ml_scores_all = _ml_score_parallel(texts, followers=scorer_ml.followers if hasattr(scorer_ml, 'followers') else None)
+    ml_scores = {v: ml_scores_all[v] for v in variants}
+    base_ns = ml_scores_all[original]
+    base_ml = Score(likes=base_ns.likes, retweets=base_ns.retweets,
+                    replies=base_ns.replies, composite=base_ns.composite)
+
+    # 2) Elo scores (normalize 0..1) for original + variants
+    results = run_elo_tournament([original] + variants, personas)
+    if not results:
+        elo_raw = {t: 0.0 for t in [original] + variants}
+    else:
+        elo_raw = {r["text"]: r.get("elo_score", r.get("elo", 1000.0)) for r in results}
+
+    mn, mx = min(elo_raw.values()), max(elo_raw.values())
+    def norm(x): return 0.0 if mx == mn else (x - mn) / (mx - mn)
+
+    # 3) Build blended for variants
+    blended = []
+    for v in variants:
+        ml_c  = ml_scores[v].composite
+        elo_c = norm(elo_raw.get(v, mn))
+        comp  = BLEND_W_ML * ml_c + BLEND_W_ELO * elo_c
+        blended.append(
+            RankedVariant(
+                variant=Variant(text=v),
+                score=Score(
+                    likes=ml_scores[v].likes,
+                    retweets=ml_scores[v].retweets,
+                    replies=ml_scores[v].replies,
+                    composite=comp
+                )
+            )
+        )
+
+    blended.sort(key=lambda r: r.score.composite, reverse=True)
+    if not blended:
+        raise RuntimeError("No valid variants to rank. All candidates were filtered out or scoring failed.")
+    winner     = blended[0]
+    # Dynamic alternates cap: respect --num_variants or uncap to all alternates
+    import inspect
+    alt_cap = max(0, int(len(variants) - 1))
+    frame = inspect.currentframe().f_back
+    if frame and "alt_cap" in frame.f_locals:
+        alt_cap = frame.f_locals["alt_cap"]
+    alternates = blended[1:1+max(0, int(alt_cap))]
 
     # 4) Compute a BLENDED base score for the ORIGINAL too (apples-to-apples)
     base_blended = Score(
@@ -1816,103 +2021,91 @@ def _ml_score_worker(text: str):
     comp = (s.likes + ALPHA_RETWEETS * s.retweets + BETA_REPLIES * s.replies)  # unify composite
     return (text, float(s.likes), float(s.retweets), float(s.replies), float(comp))
 
-
 def _ml_score_parallel(texts: List[str], followers: Optional[int] = None) -> Dict[str, SimpleNamespace]:
-    use_followers = followers if followers is not None else globals().get("FOLLOWERS_FOR_RUN", None)
-    results: Dict[str, SimpleNamespace] = {}
-    scorer_url = SCORER_URL.rstrip("/")
-    if not scorer_url.endswith("/predict"):
-        scorer_url += "/predict"
+    # Only use /predict endpoint for ML scoring
+    if not SCORER_URL:
+        # Fallback: local scoring (rare in your setup)
+        results = {}
+        for t in texts:
+            s = MLScorer().score(t, followers=followers)
+            comp = s.likes + ALPHA_RETWEETS * s.retweets + BETA_REPLIES * s.replies
+            results[t] = SimpleNamespace(likes=float(s.likes), retweets=float(s.retweets),
+                                         replies=float(s.replies), composite=float(comp))
+        return results
 
+    # Use /predict for each text
+    use_followers = followers if followers is not None else globals().get("FOLLOWERS_FOR_RUN", None)
+    results = {}
     for t in texts:
         payload = {"text": t, "return_details": False}
         if use_followers is not None:
             payload["followers"] = int(use_followers)
-        log.info(f"[_ml_score_parallel] Posting to SCORER_URL: {scorer_url} with payload: {{'return_details': False, 'followers': %s}}", payload.get("followers"))
-        try:
-            r = _SESSION.post(scorer_url, json=payload, timeout=SCORER_TIMEOUT)
-            log.info(f"[_ml_score_parallel] /predict status: {r.status_code}")
-            r.raise_for_status()
-            d = r.json()
-            likes  = float(d.get("likes", 0.0))
-            rts    = float(d.get("retweets", d.get("rts", 0.0)))
-            reps   = float(d.get("replies", 0.0))
-            comp   = likes + ALPHA_RETWEETS * rts + BETA_REPLIES * reps
-            results[t] = SimpleNamespace(likes=likes, retweets=rts, replies=reps, composite=comp)
-        except Exception as e:
-            log.error(f"[_ml_score_parallel] Error scoring text '{t[:40]}': {e}")
-            results[t] = SimpleNamespace(likes=0.0, retweets=0.0, replies=0.0, composite=0.0)
+        r = _SESSION.post(SCORER_URL, json=payload, timeout=SCORER_TIMEOUT)
+        r.raise_for_status()
+        d = r.json()
+        likes  = float(d.get("likes", 0.0))
+        rts    = float(d.get("retweets", 0.0))
+        reps   = float(d.get("replies", 0.0))
+        comp   = likes + ALPHA_RETWEETS * rts + BETA_REPLIES * reps
+        results[t] = SimpleNamespace(likes=likes, retweets=rts, replies=reps, composite=comp)
     return results
 
 # --- REPLACE: choose_winner with success-criteria aware selection ------------
 
-
-# --- REPLACE: improve_tweet to implement the exact I/O contract --------------
-# =========================
-# Winner Selection (Strict Rule)
-# =========================
-
-# --- Strict Winner Selection: Only promote if composite > original ---
-def choose_winner(
-    original: str,
-    variants: List[Variant],
-    *,
-    followers: Optional[int] = None,
-    scorer: Optional['BaseScorer'] = None,
-    local_scorer_func=None
-) -> Tuple['RankedVariant', List['RankedVariant'], 'Score']:
+def choose_winner(original: str, variants: List[Variant], *, scorer: Optional[BaseScorer] = None
+                 ) -> Tuple[RankedVariant, List[RankedVariant], Score]:
     """
     Scores original + candidates; only promote a variant if it beats the original.
     Returns (winner, alternates_sorted, original_score).
     """
-    texts = [original] + [v.text for v in variants]
+    scorer = scorer or MLScorer()
 
-    if local_scorer_func:
-        scores = {}
-        for t in texts:
-            s = local_scorer_func(t, followers)
-            scores[t] = Score(likes=s.likes, retweets=s.retweets, replies=s.replies, composite=s.composite)
-        base_score = scores[original]
-        ranked = sorted(
-            [
-                RankedVariant(
-                    variant=v,
-                    score=scores[v.text],
-                )
-                for v in variants
-            ],
-            key=lambda r: r.score.composite,
-            reverse=True,
-        )
-    else:
-        scorer = scorer or MLScorer()
-        parallel_scores = _ml_score_parallel(texts, followers=followers)  # <-- forward followers here
-        base_ns = parallel_scores[original]
-        base_score = Score(likes=base_ns.likes, retweets=base_ns.retweets,
-                           replies=base_ns.replies, composite=base_ns.composite)
-        ranked = sorted(
-            [
-                RankedVariant(
-                    variant=v,
-                    score=Score(
-                        likes=parallel_scores[v.text].likes,
-                        retweets=parallel_scores[v.text].retweets,
-                        replies=parallel_scores[v.text].replies,
-                        composite=parallel_scores[v.text].composite,
-                    ),
-                )
-                for v in variants
-            ],
-            key=lambda r: r.score.composite,
-            reverse=True,
-        )
+    # Batch original and candidates for scoring
+    texts = [original] + [v.text for v in variants]
+    parallel_scores = _ml_score_parallel(texts, followers=globals().get("FOLLOWERS_FOR_RUN", None))  # {text: SimpleNamespace(...)}
+    base_ns = parallel_scores[original]
+    base_score = Score(likes=base_ns.likes, retweets=base_ns.retweets,
+                       replies=base_ns.replies, composite=base_ns.composite)
+
+    ranked = sorted(
+        [
+            RankedVariant(
+                variant=v,
+                score=Score(
+                    likes=parallel_scores[v.text].likes,
+                    retweets=parallel_scores[v.text].retweets,
+                    replies=parallel_scores[v.text].replies,
+                    composite=parallel_scores[v.text].composite,
+                ),
+            )
+            for v in variants
+        ],
+        key=lambda r: r.score.composite,
+        reverse=True,
+    )
 
     if not ranked or ranked[0].score.composite <= base_score.composite:
         keep = RankedVariant(variant=Variant(text=original), score=base_score)
         return keep, [], base_score
 
-    return ranked[0], ranked[1:], base_score
+    # Apply conciseness bonus: if a candidate is >=10% shorter than original, boost composite
+    try:
+        orig_len = len(original)
+        for r in ranked:
+            if len(r.variant.text) < orig_len * 0.9:
+                r.score.composite *= 1.15
+    except Exception:
+        pass
 
+    # Dynamic alternates cap: respect --num_variants or uncap to all alternates
+    import inspect
+    alt_cap = max(0, int(len(variants) - 1))
+    frame = inspect.currentframe().f_back
+    if frame and "alt_cap" in frame.f_locals:
+        alt_cap = frame.f_locals["alt_cap"]
+    return ranked[0], ranked[1:1+max(0, int(alt_cap))], base_score
+
+# --- REPLACE: improve_tweet to implement the exact I/O contract --------------
 
 # --- UPDATE improve_tweet signature defaults from config ---
 def improve_tweet(
@@ -1920,8 +2113,7 @@ def improve_tweet(
     mode: Optional[str] = None,
     num_variants: int = NUM_VARIANTS_DEFAULT,
     return_all: bool = False,
-    followers: Optional[int] = None,
-    local_scorer_func=None,  # Add this parameter
+    followers: Optional[int] = None
 ) -> Dict:
     # Use followers from argument, or fallback to global if set
     if followers is None:
@@ -1955,9 +2147,9 @@ def improve_tweet(
     try:
         llm = GeminiClient(
             api_key=GEMINI_API_KEY,
-            model=SETTINGS.GEMINI_MODEL,
-            temperature=SETTINGS.TEMPERATURE,
-            timeout=SETTINGS.TIMEOUT,
+            model=GEMINI_MODEL,
+            temperature=TEMPERATURE,
+            timeout=GEN_TIMEOUT_S,
             retries=GEN_RETRIES
         )
         response_text = llm.generate_variants(prompt, n=num_variants)
@@ -1986,80 +2178,15 @@ def improve_tweet(
         max_emojis=max_emojis_budget,
         limit=CHAR_LIMIT
     )
-    # Track which candidates were filtered out (not in processed)
-    filtered_out = [c for c in raw_lines if c not in processed]
     variants = [Variant(text=v) for v in processed]
-
-    winner, alternates, base_score = choose_winner(
-        tweet_text,
-        variants,
-        followers=followers,                # <-- pass it through
-        local_scorer_func=local_scorer_func
-    )
-
-    # Persona sampling is disabled; all scoring is Gemini+HTTP scorer only.
-
-    # If no winner, try to distinguish filtered vs failed scoring
-    result = {
-        "winner": None if not winner or (winner and winner.variant.text == tweet_text) else {
-            "text": winner.variant.text,
-            "predicted": vars(winner.score),
-            "delta_vs_original": {
-                k: (getattr(winner.score, k, 0) - getattr(base_score, k, 0)) / (getattr(base_score, k, 1) or 1)
-                for k in ("likes", "retweets", "replies", "composite")
-            } if winner and winner.variant.text != tweet_text else None,
-        },
-        "alternates": [
-            {
-                "text": alt.variant.text,
-                "predicted": vars(alt.score),
-                "delta_vs_original": {
-                    k: (getattr(alt.score, k, 0) - getattr(base_score, k, 0)) / (getattr(base_score, k, 1) or 1)
-                    for k in ("likes", "retweets", "replies", "composite")
-                } if alt.variant.text != tweet_text else None,
-            }
-            for alt in alternates if alt.variant.text != tweet_text
-        ] if return_all else [],
-        "filtered": filtered_out,
-        "failed_scoring": [],
-    }
-    # If no winner and no alternates and there were processed variants, treat as failed scoring
-    if not result["winner"] and not result["filtered"] and processed:
-        result["failed_scoring"] = processed
-    return result
 
 # =========================
 # 9) CLI/LOCAL TEST
 # =========================
 if __name__ == "__main__":
-    def estimate_tokens_and_cost(prompt: str, responses: list, model: str = "gemini-pro") -> tuple:
-        """
-        Estimate total tokens and cost for a run.
-        Args:
-            prompt: The prompt string sent to the LLM.
-            responses: List of response strings from the LLM.
-            model: Model name (default: gemini-pro).
-        Returns:
-            (total_tokens, estimated_cost_usd)
-        """
-        # Gemini-pro pricing (as of 2024-06):
-        # Input: $0.00025 per 1K tokens, Output: $0.0005 per 1K tokens
-        # 1 token ≈ 4 chars (rough estimate)
-        input_tokens = max(1, len(prompt) // 4)
-        output_tokens = sum(max(1, len(r) // 4) for r in responses)
-        total_tokens = input_tokens + output_tokens
-        input_cost = input_tokens * 0.00025 / 1000
-        output_cost = output_tokens * 0.0005 / 1000
-        total_cost = input_cost + output_cost
-        return total_tokens, total_cost
     import multiprocessing
     multiprocessing.freeze_support()
     import argparse
-
-    # Enforce scorer liveness at CLI startup
-    if not wait_for_scorer_ready(timeout=15, interval=0.5, verbose=True):
-        print("[improve.py] Scorer API not ready. Refusing to run.")
-        sys.exit(1)
 
     parser = argparse.ArgumentParser(description="Tweet improvement engine")
     parser.add_argument("tweet_text", type=str, help="The tweet text to improve")
@@ -2068,16 +2195,19 @@ if __name__ == "__main__":
     parser.add_argument("--num_variants", type=int, default=NUM_VARIANTS_DEFAULT, help="Number of variants")
     parser.add_argument("--print_all_llm", action="store_true", help="Print all LLM-generated tweets (raw, before post-processing)")
     parser.add_argument("--followers", type=int, help="Follower count to use for scoring")
+    parser.add_argument("--persona-seed", type=int, help="Seed for persona sampling (stabilizes Elo)")
     args = parser.parse_args()
 
-    # --- Follower count: ask every run or via flag (required) ---
+    # --- Follower count: ask every run or via flag ---
     FOLLOWERS_FOR_RUN = args.followers
     if FOLLOWERS_FOR_RUN is None:
         try:
-            FOLLOWERS_FOR_RUN = int(input("Enter follower count: ").strip())
+            FOLLOWERS_FOR_RUN = int(input("How many followers should we assume for scoring? ").strip())
         except Exception:
-            print("[improve.py] Follower count required.")
-            sys.exit(1)
+            FOLLOWERS_FOR_RUN = 100_000  # reasonable default
+
+    # Persona seed for stable Elo sampling
+    PERSONA_SEED_FOR_RUN = args.persona_seed if args.persona_seed is not None else FOLLOWERS_FOR_RUN
 
     # --- BEGIN: Show pre/post-processing variants for CLI/debug ---
     t_total = time.time()
@@ -2095,10 +2225,10 @@ if __name__ == "__main__":
     try:
         llm = GeminiClient(
             api_key=GEMINI_API_KEY,
-            model=SETTINGS.GEMINI_MODEL,
-            temperature=SETTINGS.TEMPERATURE,
-            timeout=SETTINGS.TIMEOUT,
-            retries=SETTINGS.RETRIES
+            model=GEMINI_MODEL,
+            temperature=TEMPERATURE,
+            timeout=GEN_TIMEOUT_S,
+            retries=GEN_RETRIES
         )
         response_text = llm.generate_variants(prompt, n=num_variants)
         if isinstance(response_text, str):
@@ -2140,8 +2270,11 @@ if __name__ == "__main__":
 
     # 5) Call improve_tweet for final scoring and output
     # Patch all Elo/blend scoring calls to use the persona seed
+    def patched_sample_personas(personas, text, k=PERSONA_SAMPLE_SIZE, seed=None):
+        return _sample_personas_with_seed(personas, text, k=k, seed=PERSONA_SEED_FOR_RUN)
 
-    # Persona sampling is disabled; all scoring is Gemini+HTTP scorer only.
+    _sample_personas_orig = _sample_personas
+    _sample_personas = patched_sample_personas
 
     result = improve_tweet(
         tweet_text=args.tweet_text,
@@ -2151,60 +2284,29 @@ if __name__ == "__main__":
         followers=FOLLOWERS_FOR_RUN,
     )
 
-    # Persona sampling is disabled; nothing to restore
+    # Restore original _sample_personas in case of further use
+    _sample_personas = _sample_personas_orig
 
     print("\n=== WINNER ===")
+
     if not result or not result.get("winner"):
-        # Try to distinguish between filtered out and failed scoring
-        filtered = result.get("filtered", []) if result else []
-        failed = result.get("failed_scoring", []) if result else []
-        alternates = result.get("alternates", []) if result else []
-        if filtered and not alternates:
-            print("No winning variant could be selected. All candidates were filtered out (e.g., by constraints or post-processing).")
-            print("\n=== FILTERED OUT VARIANTS ===")
-            for v in filtered:
-                print(f"- {v}")
-        elif failed and not alternates:
-            print("No winning variant could be selected. All candidates failed scoring (e.g., scorer error or invalid scores).")
-            print("\n=== FAILED SCORING VARIANTS ===")
-            for v in failed:
-                print(f"- {v}")
-        else:
-            print("No winning variant could be selected. All candidates may have been filtered out or failed scoring.")
+        print("No winning variant could be selected. All candidates may have been filtered out or failed scoring.")
     else:
-        winner = result["winner"]
-        print(winner["text"])
-        pred = winner.get("predicted", {})
-        print(f"Predicted: Likes={pred.get('likes','?')}, Retweets={pred.get('retweets','?')}, Replies={pred.get('replies','?')}, Composite={pred.get('composite','?')}")
-        uplift = winner.get("delta_vs_original", {})
-        if isinstance(uplift, dict):
-            comp = uplift.get("composite")
-            if comp is not None:
-                try:
-                    pct = float(comp) * 100
-                    print(f"Percent uplift vs original: {pct:.2f}%")
-                except Exception:
-                    print(f"Percent uplift vs original: {comp}")
-            else:
-                print(f"Percent uplift vs original: {uplift}")
-        else:
-            print(f"Percent uplift vs original: {uplift}")
+        print(result["winner"]["text"])
+        print("Predicted:", result["winner"]["predicted"])
+        print("Delta vs original:", result["winner"]["delta_vs_original"])
 
-    if args.return_all:
-        print("\n=== ALTERNATES ===")
-        if not result or not result.get("alternates"):
-            print("No alternates available.")
-        else:
-            for alt in result["alternates"]:
-                pred = alt.get("predicted", {})
-                print(f"- {alt['text']} (Likes={pred.get('likes','?')}, Retweets={pred.get('retweets','?')}, Replies={pred.get('replies','?')}, Composite={pred.get('composite','?')})")
+    print("\n=== ALTERNATES ===")
+    if not result or not result.get("alternates"):
+        print("No alternates available.")
+    else:
+        for alt in result["alternates"]:
+            print("-", alt["text"], alt["predicted"])
 
-    # --- Print token/cost estimate for this run ---
-    # Use the prompt and LLM-generated variants (raw_lines)
-    try:
-        prompt_for_cost = prompt if 'prompt' in locals() else args.tweet_text
-        responses_for_cost = raw_lines if 'raw_lines' in locals() else []
-        tokens, cost = estimate_tokens_and_cost(prompt_for_cost, responses_for_cost)
-        print(f"\n[Token/Cost Estimate] Total tokens: {tokens:,} | Estimated cost: ${cost:.5f} (Gemini-pro)\n")
-    except Exception as e:
-        print(f"[Token/Cost Estimate] Could not compute: {e}")
+    print("\n=== CONTEXT ===")
+    if not result or not result.get("explanations"):
+        print("No context/explanations available.")
+    else:
+        print("Why this won:", result["explanations"].get("why_this_won", "N/A"))
+        print("Applied transforms:", result["explanations"].get("applied_transformations", "N/A"))
+        print("Guardrails:", result.get("guardrails", "N/A"))

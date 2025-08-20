@@ -1,3 +1,23 @@
+
+
+    
+# --- Local scoring function for improve_tweet ---
+from typing import NamedTuple
+
+class SimpleScore(NamedTuple):
+    likes: float
+    retweets: float
+    replies: float
+    composite: float
+
+def local_scorer(text: str, followers: int) -> SimpleScore:
+    resp = _compute(text, followers, return_details=False)
+    likes = float(resp.likes)
+    retweets = float(resp.retweets)
+    replies = float(resp.replies)
+    composite = likes + 2.0 * retweets + 1.0 * replies  # same weights as ML scorer
+    return SimpleScore(likes, retweets, replies, composite)
+
 def preload_hf_models():
     auth = {"token": HF_TOKEN} if HF_TOKEN else {}
     for repo in PRELOAD_MODELS:
@@ -422,10 +442,9 @@ def _append_timing_csv(row: dict) -> None:
 def _compute(text: str, followers: int, return_details: bool) -> PredictResponse:
     t_route0 = time.perf_counter()  # NEW
 
-    # Always use blend mode: combine ML and persona_engine (Elo) scores
-    override_w = pick_blend_weights(followers)  # This sets blend weights (e.g., 0.7 ML, 0.3 Elo)
+    override_w = pick_blend_weights(followers)
     t_pred0 = time.perf_counter()  # NEW
-    base = predict_blended(text, override_w)  # predict_blended already blends ML and persona_engine
+    base = predict_blended(text, override_w)
     t_pred_ms = int((time.perf_counter() - t_pred0) * 1000)  # total predict_blended wall time (backup)
     blended = base.get("blended", {"likes": 0.0, "retweets": 0.0, "replies": 0.0})
 
@@ -605,7 +624,6 @@ def _compute(text: str, followers: int, return_details: bool) -> PredictResponse
             "models_used": base.get("models_used", {}),
             "ml_raw": base.get("ml", {}),
             "persona_raw": base.get("persona", {}),
-            "blend_weights": override_w,  # Explicitly show blend weights used
             "blended_before_scaling": blended,
             "scaling_factors": scales,
             "follower_baselines": baselines_for(followers, cfg),
@@ -634,10 +652,21 @@ def _compute(text: str, followers: int, return_details: bool) -> PredictResponse
 # ---------- Routes ----------
 
 
+
 # Real health endpoint
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
+
+# Add /predict/healthz for compatibility
+# Add /predict/healthz for compatibility
+@app.get("/predict/healthz")
+def predict_healthz():
+    return {"ok": True}
+
+
+
+
 
 @app.get("/")
 def root() -> Dict[str, str]:
