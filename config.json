@@ -1,0 +1,22 @@
+{
+  "HF_TOKEN": "",
+  "HF_HOME": ".hf_cache",
+  "HF_HUB_ENABLE_HF_TRANSFER": true,
+  "HF_TIMEOUT": 60,
+  "GEMINI_API_KEY": "",
+  "SCORING_MODE": "blend",
+  "NUM_VARIANTS": 8,
+  "GEMINI_MODEL": "models/gemini-1.5-pro",
+  "TEMPERATURE": 0.95,
+  "ALPHA_RETWEETS": 2.0,
+  "BETA_REPLIES": 1.0,
+  "MAX_NEW_HASHTAGS": 0,
+  "MAX_EMOJIS": 0,
+  "ALLOW_CTA": false,
+  "PERSONA_SAMPLE_SIZE": 300,
+  "TRENDING_HASHTAGS_ENABLED": false,
+  "TIMEOUT": 20,
+  "RETRIES": 1,
+  "DIVERSITY_THRESHOLD": 0.82
+
+  }
