@@ -1,6 +1,33 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+.conda/
+
+# Caches / datasets / models
 .hf_cache/
-logs/
-*.csv
+.huggingface/
+datasets/
+checkpoints/
+models/
+*.pt
+*.bin
+*.ckpt
+*.h5
+*.onnx
+*.safetensors
+
+# Compiled libs (don’t commit these)
+*.dll
+*.lib
+
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
