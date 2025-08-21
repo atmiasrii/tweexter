@@ -1,32 +1,33 @@
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from typing import Optional, Dict, Any
 import time
 import logging
-
-# --- models for /improve ---
-from pydantic import BaseModel, Field, validator
-from typing import Optional, Dict, Any
-
-
-# Import the improve_tweet function from improve.py
-from improve import improve_tweet
-
 import os
 import importlib
 import requests
 
+# --- Import your improve function
+from improve import improve_tweet
 
-# ADD CORS middleware (edit origins as needed)
+# --- FastAPI app setup ---
+app = FastAPI()
+
+# --- CORS setup (add all domains/ports you need) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",     # Lovable/Next dev
-        "https://*.lovable.dev",     # Lovable preview domains
-        "https://your-prod-domain.com"
+        "http://localhost:3000",         # local dev frontend
+        "http://127.0.0.1:3000",         # alternative local
+        "https://*.lovable.dev",         # Lovable preview domains
+        "https://tweexter.co",           # main domain
+        "https://www.tweexter.co",       # with www
+        "https://api.tweexter.co",       # production API
+        "https://api2.tweexter.co",      # new API2
     ],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
