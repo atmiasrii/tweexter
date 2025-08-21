@@ -26,6 +26,7 @@ app.add_middleware(
         "https://www.tweexter.co",       # with www
         "https://api.tweexter.co",       # production API
         "https://api2.tweexter.co",      # new API2
+        "https://preview--tweexter.lovable.app",  # Lovable preview
     ],
     allow_credentials=True,
     allow_methods=["*"],
