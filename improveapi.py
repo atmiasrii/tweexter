@@ -1,3 +1,13 @@
+# --- Utility: Extract tweet text from dict for frontend display ---
+def extract_tweet_text(response):
+    """
+    Given a response like {'v2': "..."}, return only the tweet text.
+    If response is not a dict, return as-is.
+    """
+    if isinstance(response, dict):
+        return next(iter(response.values()), "")
+    return str(response)
+
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -115,6 +125,8 @@ async def improve(req: ImproveRequest):
         return ImproveResponse(improved_text=req.text)
 
     improved_text = winner.get("text", req.text)
+    # If improved_text is a dict like {'v2': '...'}, extract the value
+    improved_text = extract_tweet_text(improved_text)
     predicted_dict = winner.get("predicted") or None
     delta_vs_original = winner.get("delta_vs_original")
     details = result.get("details")
