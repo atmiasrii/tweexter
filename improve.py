@@ -12,6 +12,11 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+def _looks_like_question(text: str) -> bool:
+    """Detect if the tweet seems like a question or engagement-seeking."""
+    question_words = ("does", "should", "can", "is", "are", "will", "how", "why", "what", "when")
+    text_lower = text.strip().lower()
+    return text_lower.endswith("?") or text_lower.startswith(question_words)
 import re, unicodedata
 import os
 import json
@@ -70,12 +75,13 @@ class MiniPost:
         return text[:limit]
     @staticmethod
     def dedupe(texts: list) -> list:
-        # Stub: remove duplicates, preserve order
+        # Deduplicate only on exact match, preserve order
         seen = set()
         result = []
         for t in texts:
-            if t not in seen:
-                seen.add(t)
+            norm = t.strip()
+            if norm not in seen:
+                seen.add(norm)
                 result.append(t)
         return result
     @staticmethod
@@ -98,15 +104,36 @@ class MiniPost:
         return text[:limit].rsplit(' ', 1)[0]
     @staticmethod
     def dedupe(texts: List[str]) -> List[str]:
+        # Deduplicate only on exact match, preserve order
         seen = set()
         out = []
         for t in texts:
-            key = re.sub(r'\W+', '', t.lower())
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(t)
+            norm = t.strip()
+            if norm not in seen:
+                seen.add(norm)
+                out.append(t)
         return out
+def normalize_text(text: str) -> str:
+    """
+    Looser normalization:
+    - Keep case, punctuation, hashtags, and structure.
+    - Only trim whitespace at ends.
+    """
+    return text.strip()
+
+def deduplicate_variants(variants: List[str]) -> List[str]:
+    """
+    Deduplicate only on exact match.
+    Preserves variety even if tweets share many words.
+    """
+    seen = set()
+    unique = []
+    for v in variants:
+        norm = normalize_text(v)
+        if norm not in seen:
+            seen.add(norm)
+            unique.append(v)
+    return unique
     @staticmethod
     def sanitize_basic(s: str, entities: 'Entities') -> str:
         s = s.strip()
@@ -395,44 +422,8 @@ EMOJI_RE   = re.compile(
     r']'
 )
 
-# --- Step B detectors ---
-HOOK_PREFIXES = (
-    "Unpopular opinion:", "Reminder:", "Hot take:", "PSA:", "Heads up:",
-    "Fact:", "Myth:", "Reality:", "New:", "Data:", "Update:"
-)
-QUESTION_GENERIC = {
-    "thoughts?", "what do you think?", "agree?", "opinions?",
-    "what are your thoughts?", "your thoughts?"
-}
-BENEFIT_PREFIXES = ("Payoff:", "The win:", "You get:", "Outcome:", "What you’ll get:")
-CURIOSITY_TOKENS = ("Ever wonder", "Here’s the twist:", "The catch:", "Counterintuitive")
-CONTRAST_TOKENS  = (" vs ", "Before", "After", "Old way", "New way", "→", "vs.")
 
-def _starts_with_number(s: str) -> bool:
-    return bool(re.match(r'^\s*[\d#@]', s))
 
-def _has_prefix(s: str, prefixes) -> bool:
-    t = s.strip()
-    return any(t.startswith(p) for p in prefixes)
-
-def is_hook_variant(s: str) -> bool:
-    return _starts_with_number(s) or _has_prefix(s, HOOK_PREFIXES)
-
-def is_specific_question(s: str, original: str) -> bool:
-    if "?" not in s: return False
-    t = s.lower()
-    if any(p in t for p in QUESTION_GENERIC): return False
-    ent = Entities.from_text(original)
-    return bool(ent.hashtags or ent.mentions or KEY_NUMBER_RE.search(original))
-
-def is_benefit_first(s: str) -> bool:
-    return _has_prefix(s, BENEFIT_PREFIXES)
-
-def has_curiosity_gap(s: str) -> bool:
-    return any(tok in s for tok in CURIOSITY_TOKENS)
-
-def has_contrast(s: str) -> bool:
-    return any(tok in s for tok in CONTRAST_TOKENS)
 
 # Numbers/dates (enhanced from earlier)
 KEY_NUMBER_RE = re.compile(r'(?<![\w.])(?:\$?\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d+|\d+%)(?![\w.])')
@@ -731,11 +722,15 @@ class PromptBuilder:
         ]
         variant_roles = {f"v{i+1}": roles_bank[i] for i in range(min(n, len(roles_bank)))}
 
-        def _length_targets_for(n: int):
-            m = {f"v{i}": "~100" for i in range(1, n+1)}
-            if n >= 2: m["v2"] = "<=60"
-            if n >= 3: m["v3"] = "200-240"
-            return m
+        def _length_targets_for(n):
+            """
+            Define tweet length sweet spots for engagement diversity.
+            """
+            return [
+                {"min": 1, "max": 60, "label": "ultra_short"},      # provocative one-liner
+                {"min": 90, "max": 110, "label": "punchy_mid"},     # ~100 chars sweet spot
+                {"min": 200, "max": 240, "label": "detail_rich"},   # substantive but digestible
+            ]
 
         # === Section A: Content + Length Rules ===
         content_rules = {
@@ -764,22 +759,33 @@ class PromptBuilder:
         }
 
         diversity_requirements = [
-            "Each variant must be meaningfully different (no near-synonyms).",
-            "At least one uses a specific, on-topic question (not generic).",
-            "At least one is benefit-first.",
-            "At least one uses a concise hook.",
-            "At least one is an ultra-concise rewrite (<=60 chars).",
-            "At least one is longer with substance (200–240 chars)."
+            {"style": "contrarian_hot_take", "example": "Unpopular opinion: …"},
+            {"style": "storytelling", "example": "Last year I struggled with X. Here’s what changed…"},
+            {"style": "list_hook", "example": "3 keys to doing X better:"},
+            {"style": "meme_playful", "example": "When you try X and end up Y 😂"},
         ]
 
         style_goals = {
-            "type": kind,
+            "diversity_requirements": diversity_requirements,
             "notes": [
-                "news: fact/stat up front; authoritative; optional topical hashtag.",
-                "personal: vivid opener; one natural question allowed.",
-                "promo: benefit-first; one proof/number; single crisp CTA.",
-                "general: sharp hook; optional contrarian/novel angle."
+                "Ensure at least one variant leans emotional (excitement, worry, or awe, consistent with original tone).",
+                "Ensure at least one variant adds a relatable framing (e.g., ‘If you’ve ever X, you know…’)."
             ]
+        }
+
+        hashtag_emoji_rules = {
+            "news": {
+                "emoji": "0–1 max",
+                "hashtags": "1 topical hashtag"
+            },
+            "personal": {
+                "emoji": "0–2 max",
+                "hashtags": "light, optional"
+            },
+            "promo": {
+                "emoji": "1 proof + optional CTA emoji (👉/👇 only)",
+                "hashtags": "reasonable, non-spammy"
+            }
         }
 
         # Output contract: strict JSON only
@@ -806,7 +812,7 @@ class PromptBuilder:
             {
                 "type": "promo",
                 "original": "Try our tool for faster marketing.",
-                "better":   "Save ~3 hours/week on campaigns with <tool>. Used by 1,200+ teams. Start free."
+                "better":   "Save ~3 hours/week on campaigns with <tool>."
             },
             {
                 "type": "general",
@@ -833,6 +839,7 @@ class PromptBuilder:
         }
 
         # --- ADD Step-B: Engagement Mechanics ---
+
         engagement_mechanics = {
             "variant_roles": {
                 "v1": "hook",               # bold hook opener
@@ -843,10 +850,7 @@ class PromptBuilder:
                 "v6": "editor_choice"       # free slot for diversity
             },
             "hook_requirements": {
-                "must_begin_with": [
-                    "Unpopular opinion:", "Reminder:", "Hot take:", "PSA:", "Heads up:",
-                    "Fact:", "Myth:", "Reality:", "New:", "Data:", "Update:"
-                ],
+                "must_begin_with": [],
                 "also_ok_if_starts_with_number": True
             },
             "question_rules": {
@@ -881,6 +885,13 @@ class PromptBuilder:
                 "Steal this framework:"
             ]
         }
+
+        # Conditional rule: only add strong-ending variants if tweet looks like a question
+        if _looks_like_question(text):
+            engagement_mechanics["end_variant_requirements"] = [
+                "At least one improved version must end with either a question OR a punchy payoff line (e.g., '— and that changes everything.')"
+            ]
+
         payload["engagement_mechanics"] = engagement_mechanics
 
         # Final guard: force JSON-only response
@@ -901,7 +912,67 @@ class PromptBuilder:
             else:
                 return obj
         payload = convert_sets(payload)
-        return json.dumps(payload, ensure_ascii=False)
+
+        # --- NEW: Expanded prompt assembly with emotional & relatable requirements ---
+        prompt = f'''
+You are a world-class social copywriter and growth strategist. 
+Your role is not just to rewrite tweets, but to transform them into highly engaging, 
+scroll-stopping versions that preserve the original meaning while maximizing clarity, punch, and virality potential.
+
+Original tweet: "{text.strip()}"
+
+Rules:
+- Keep the **same meaning and overall structure** as the original.
+- Do **not drift** into generic motivational content.
+- Preserve the original meaning and intent exactly.
+- Do NOT reframe statements as questions.
+- Avoid rhetorical devices like "Ever feel...?" or "What if...?" unless the original tweet was already written that way.
+- Keep tone direct, motivational, and easy to read.
+- Focus on optimizing clarity, punch, and flow without adding extra context.
+- Each variant should be a natural standalone tweet.
+- Optimize only the **phrasing, clarity, rhythm, and hook strength**.
+- Each variant must feel natural and human, but more engaging.
+- You are a high powered paraphrasing tool, so don't change the meaning or the purpose of the text in any way, but don't keep it exactly similar either.
+
+Think in three steps before writing:
+1. Identify the core “hook” or payoff in the original tweet (the stat, claim, tension, or curiosity gap).
+2. Reframe it in multiple high-performing formats (hooks, questions, contrasts, benefit-first, curiosity gaps, etc.), 
+   following the engagement mechanics and style goals provided.
+3. Ensure every version is optimized for Twitter: scannable at a glance, emotionally resonant, 
+   and designed to earn replies, likes, or shares.
+
+Improvement goals:
+- Engagement mechanics: {json.dumps(engagement_mechanics, ensure_ascii=False)}
+- Style goals: {json.dumps(style_goals, ensure_ascii=False)}
+- Hashtag & Emoji discipline: 
+  News tweets: {json.dumps(hashtag_emoji_rules["news"], ensure_ascii=False)}
+  Personal tweets: {json.dumps(hashtag_emoji_rules["personal"], ensure_ascii=False)}
+  Promo tweets: {json.dumps(hashtag_emoji_rules["promo"], ensure_ascii=False)}
+
+
+- Style goals:
+  Diversity requirements: {json.dumps(style_goals.get("diversity_requirements", []), ensure_ascii=False)}
+  Notes: {json.dumps(style_goals.get("notes", []), ensure_ascii=False)}
+
+- Hashtag & Emoji discipline:
+  News tweets: {json.dumps(hashtag_emoji_rules["news"], ensure_ascii=False)}
+  Personal tweets: {json.dumps(hashtag_emoji_rules["personal"], ensure_ascii=False)}
+  Promo tweets: {json.dumps(hashtag_emoji_rules["promo"], ensure_ascii=False)}
+
+Output requirements:
+- Generate {n} improved variants.
+- Each must be distinct, short, sharp, and easy to scan in a Twitter feed.
+- Preserve factual meaning, links, mentions, and hashtags exactly as given.
+- Do NOT add generic filler questions like “like if agree?” or “What do you think?”.
+- At least one variant should create curiosity, at least one should highlight a benefit, 
+  and at least one should feel contrarian or bold.
+- Avoid sounding robotic or forced; every variant should feel like it was written by a human 
+  who deeply understands social media dynamics.  
+
+IMPORTANT/ESSENTIAL/MUST FOLLOW:Variants must preserve the core meaning of the original tweet.
+Now generate {n} improved versions that meet the above goals. Keep each version short, punchy, and Twitter-appropriate.
+'''
+        return prompt
 
 ## =========================
 # 4) GEMINI CLIENT (real)
@@ -928,7 +999,7 @@ class GeminiClient:
                     "role": "user",
                     "parts": [
                         {
-                            "text": "You are an expert tweet editor. Follow the JSON instructions strictly.\n\n" + prompt
+                            "text": "You are a world-class social copywriter and growth strategist, paraphrase the tweet for better likes and metrics.\n\n" + prompt
                         }
                     ],
                 }
@@ -1168,28 +1239,6 @@ def ensure_engagement_mechanics(variants: List[str], original: str, ent: Entitie
     shortest_i = min(range(len(out)), key=lambda i: len(out[i]))
     longest_i  = max(range(len(out)), key=lambda i: len(out[i]))
 
-    if not have_hook:
-        safe_prepend(shortest_i, "Reminder:")
-
-    if not have_question:
-        # Build a sane question topic
-        m_pair = re.search(r'\b\d+\s+\w+', original)
-        topic = (ent.hashtags[0] if ent.hashtags else ent.mentions[0] if ent.mentions else (m_pair.group(0) if m_pair else "this process"))
-        q = f"What would you change first about {topic}?"
-        s = out[0]
-        cand = (s.rstrip(".! ") + " " + q).strip()
-        cand = PostProcessor.enforce_limits(cand, ent, MAX_NEW_HASHTAGS, MAX_EMOJIS_GENERAL, CHAR_LIMIT)
-        cand = _dedupe_links(cand)
-        out[0] = cand
-
-    if not have_benefit:
-        safe_prepend(shortest_i, "You get:")
-
-    if not have_curiosity:
-        safe_prepend(longest_i, "Ever wonder why? Here’s the twist:")
-
-    if not have_contrast:
-        safe_prepend(longest_i, "Before → After:")
 
     return out
 
@@ -1344,10 +1393,6 @@ def enforce_promo_style(original: str, text: str) -> str:
     return text
 
 def enforce_general_style(original: str, text: str) -> str:
-    # Ensure there is a hook/novel angle; if not, prepend an allowed hook
-    if not is_hook_variant(text):
-        # Prefer "Hot take:" if it won't clash with tone
-        text = f"Hot take: {text}"
     return text
 
 def apply_type_style(original: str, text: str, kind: str) -> Tuple[str, bool]:
@@ -1680,7 +1725,7 @@ def ensure_diversity(cands: List[str]) -> List[str]:
         if re.search(r'\babout\s+\d+\?\b', s):
             continue
         # Clean up 'Reminder:'/Hot take: prefix if doubled
-        s = re.sub(r'\bReminder:\s*Hot take:\s*', 'Hot take: ', s)
+            s = re.sub(r'\b(Reminder:|Hot take:)\s*', '', s)
         out.append(s)
     return out
 
@@ -1886,32 +1931,67 @@ def choose_winner(
         )
     else:
         scorer = scorer or MLScorer()
-        parallel_scores = _ml_score_parallel(texts, followers=followers)  # <-- forward followers here
-        base_ns = parallel_scores[original]
-        base_score = Score(likes=base_ns.likes, retweets=base_ns.retweets,
-                           replies=base_ns.replies, composite=base_ns.composite)
+        parallel_scores = []
+        for t in texts:
+            s = scorer.score(t, followers)
+            parallel_scores.append((t, Score(
+                likes=s.likes,
+                retweets=s.retweets,
+                replies=s.replies,
+                composite=getattr(s, "likes_high", s.likes * 1.2),
+            )))
+
+        # Find base_score for the original
+        base_score = None
+        for t, score in parallel_scores:
+            if t == original:
+                base_score = score
+                break
+        if base_score is None:
+            base_score = Score(likes=0.0, retweets=0.0, replies=0.0, composite=0.0)
+
         ranked = sorted(
             [
                 RankedVariant(
-                    variant=v,
-                    score=Score(
-                        likes=parallel_scores[v.text].likes,
-                        retweets=parallel_scores[v.text].retweets,
-                        replies=parallel_scores[v.text].replies,
-                        composite=parallel_scores[v.text].composite,
-                    ),
+                    variant=Variant(text=t),
+                    score=score,
                 )
-                for v in variants
+                for (t, score) in parallel_scores if t != original
             ],
             key=lambda r: r.score.composite,
             reverse=True,
         )
 
-    if not ranked or ranked[0].score.composite <= base_score.composite:
+    # --- Debug print for scoring ---
+    print("\n--- Debug Scoring ---")
+    print("Original:", base_score.composite, "likes:", base_score.likes)
+    for r in ranked[:5]:
+        print("Variant:", r.variant.text[:50], "…", r.score.composite, "likes:", r.score.likes)
+    print("---------------------\n")
+
+
+    # --- Loosen strictness: allow variants within ±5% margin ---
+    MARGIN = 0.05  # 5% tolerance
+
+    if not ranked:
         keep = RankedVariant(variant=Variant(text=original), score=base_score)
         return keep, [], base_score
 
-    return ranked[0], ranked[1:], base_score
+    top = ranked[0]
+    margin_threshold = base_score.composite * (1 - MARGIN)
+
+    if top.score.composite >= margin_threshold:
+        # Accept top variant if it's within 5% of original or better
+        winner = top
+    else:
+        # Fall back to original if top is much worse
+        winner = RankedVariant(variant=Variant(text=original), score=base_score)
+
+    # --- Blend scoring + heuristics: always include at least 2 alternates ---
+    # Take the next 2 Gemini variants regardless of score
+    alternates = ranked[1:3] if len(ranked) > 2 else ranked[1:]
+
+    return winner, alternates, base_score
 
 
 # --- UPDATE improve_tweet signature defaults from config ---
@@ -2000,9 +2080,15 @@ def improve_tweet(
     # Persona sampling is disabled; all scoring is Gemini+HTTP scorer only.
 
     # If no winner, try to distinguish filtered vs failed scoring
+    def enforce_twitter_limit(text):
+        text = text.strip()
+        if len(text) > 280:
+            return text[:277].rstrip() + "..."
+        return text
+
     result = {
         "winner": None if not winner or (winner and winner.variant.text == tweet_text) else {
-            "text": winner.variant.text,
+            "text": enforce_twitter_limit(winner.variant.text),
             "predicted": vars(winner.score),
             "delta_vs_original": {
                 k: (getattr(winner.score, k, 0) - getattr(base_score, k, 0)) / (getattr(base_score, k, 1) or 1)
@@ -2011,7 +2097,7 @@ def improve_tweet(
         },
         "alternates": [
             {
-                "text": alt.variant.text,
+                "text": enforce_twitter_limit(alt.variant.text),
                 "predicted": vars(alt.score),
                 "delta_vs_original": {
                     k: (getattr(alt.score, k, 0) - getattr(base_score, k, 0)) / (getattr(base_score, k, 1) or 1)
