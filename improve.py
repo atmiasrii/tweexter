@@ -25,7 +25,7 @@ import random
 import logging
 import dataclasses
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuplex
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from types import SimpleNamespace
 from functools import lru_cache
@@ -1870,31 +1870,35 @@ def _ml_score_worker(text: str):
     return (text, float(s.likes), float(s.retweets), float(s.replies), float(comp))
 
 
-def _ml_score_parallel(texts: List[str], followers: Optional[int] = None) -> Dict[str, SimpleNamespace]:
-    use_followers = followers if followers is not None else globals().get("FOLLOWERS_FOR_RUN", None)
-    results: Dict[str, SimpleNamespace] = {}
+def _ml_score_parallel(texts: List[str], followers: Optional[int] = None, max_workers: int = 8):
     scorer_url = SCORER_URL.rstrip("/")
     if not scorer_url.endswith("/predict"):
         scorer_url += "/predict"
 
-    for t in texts:
+    results = {}
+
+    def _score_one(t: str):
         payload = {"text": t, "return_details": False}
-        if use_followers is not None:
-            payload["followers"] = int(use_followers)
-        log.info(f"[_ml_score_parallel] Posting to SCORER_URL: {scorer_url} with payload: {{'return_details': False, 'followers': %s}}", payload.get("followers"))
-        try:
-            r = _SESSION.post(scorer_url, json=payload, timeout=SCORER_TIMEOUT)
-            log.info(f"[_ml_score_parallel] /predict status: {r.status_code}")
-            r.raise_for_status()
-            d = r.json()
-            likes  = float(d.get("likes", 0.0))
-            rts    = float(d.get("retweets", d.get("rts", 0.0)))
-            reps   = float(d.get("replies", 0.0))
-            comp   = likes + ALPHA_RETWEETS * rts + BETA_REPLIES * reps
-            results[t] = SimpleNamespace(likes=likes, retweets=rts, replies=reps, composite=comp)
-        except Exception as e:
-            log.error(f"[_ml_score_parallel] Error scoring text '{t[:40]}': {e}")
-            results[t] = SimpleNamespace(likes=0.0, retweets=0.0, replies=0.0, composite=0.0)
+        if followers is not None:
+            payload["followers"] = int(followers)
+        r = _SESSION.post(scorer_url, json=payload, timeout=SCORER_TIMEOUT)
+        r.raise_for_status()
+        d = r.json()
+        likes  = float(d.get("likes", 0.0))
+        rts    = float(d.get("retweets", d.get("rts", 0.0)))
+        reps   = float(d.get("replies", 0.0))
+        comp   = likes + ALPHA_RETWEETS * rts + BETA_REPLIES * reps
+        return t, SimpleNamespace(likes=likes, retweets=rts, replies=reps, composite=comp)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_text = {executor.submit(_score_one, t): t for t in texts}
+        for fut in as_completed(future_to_text):
+            try:
+                t, score = fut.result()
+                results[t] = score
+            except Exception as e:
+                logging.error(f"Error scoring {future_to_text[fut][:40]}: {e}")
+                results[future_to_text[fut]] = SimpleNamespace(likes=0, retweets=0, replies=0, composite=0)
     return results
 
 # --- REPLACE: choose_winner with success-criteria aware selection ------------
@@ -1938,16 +1942,17 @@ def choose_winner(
             reverse=True,
         )
     else:
-        scorer = scorer or MLScorer()
-        parallel_scores = []
-        for t in texts:
-            s = scorer.score(t, followers)
-            parallel_scores.append((t, Score(
-                likes=s.likes,
-                retweets=s.retweets,
-                replies=s.replies,
-                composite=getattr(s, "likes_high", s.likes * 1.2),
-            )))
+        results = _ml_score_parallel(texts, followers=followers, max_workers=8)
+
+    parallel_scores = []
+    for t, s in results.items():
+        score = Score(
+            likes=s.likes,
+            retweets=s.retweets,
+            replies=s.replies,
+            composite=s.composite,
+        )
+        parallel_scores.append((t, score))
 
         # Find base_score for the original
         base_score = None
