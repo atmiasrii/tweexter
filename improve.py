@@ -227,12 +227,12 @@ class Settings:
     NUM_VARIANTS: int = 30                     # Default is now 30
     ALPHA_RETWEETS: float = 2.0
     BETA_REPLIES: float = 1.0
-    MAX_NEW_HASHTAGS: int = 1
+    MAX_NEW_HASHTAGS: int = 0
     MAX_EMOJIS: int = 2
     ALLOW_CTA: bool = True
     TRENDING_HASHTAGS_ENABLED: bool = True
     GEMINI_MODEL: str = "models/gemini-2.5-flash"  # Gemini 2.5 Flash
-    TEMPERATURE: float = 0.85
+    TEMPERATURE: float = 0.3
     TIMEOUT: int = 20                          # seconds
     RETRIES: int = 2
     DISABLE_ENGAGEMENT_MECHANICS: bool = True
@@ -915,8 +915,10 @@ class PromptBuilder:
 
         # --- NEW: Expanded prompt assembly with emotional & relatable requirements ---
         prompt = f'''
-You are a world-class social copywriter and growth strategist. 
-Your role is not just to rewrite tweets, but to transform them into highly engaging, 
+"You are a high-end paraphrasing engine for social media. 
+Your role is to rephrase the tweet into multiple variants 
+that are more engaging while keeping the meaning and facts EXACT. 
+your role is not just to paraphrase tweets, but to transform them into highly engaging, 
 scroll-stopping versions that preserve the original meaning while maximizing clarity, punch, and virality potential.
 
 Original tweet: "{text.strip()}"
@@ -924,6 +926,9 @@ Original tweet: "{text.strip()}"
 Rules:
 - Keep the **same meaning and overall structure** as the original.
 - Do **not drift** into generic motivational content.
+- Do NOT invent, add, or remove any facts, stats, or claims.
+- Do NOT change the intent (e.g., a statement stays a statement).
+
 - Preserve the original meaning and intent exactly.
 - Do NOT reframe statements as questions.
 - Avoid rhetorical devices like "Ever feel...?" or "What if...?" unless the original tweet was already written that way.
@@ -936,7 +941,7 @@ Rules:
 
 Think in three steps before writing:
 1. Identify the core “hook” or payoff in the original tweet (the stat, claim, tension, or curiosity gap).
-2. Reframe it in multiple high-performing formats (hooks, questions, contrasts, benefit-first, curiosity gaps, etc.), 
+2. Reframe it in multiple high-performing formats (hooks, questions, contrasts, curiosity gaps, etc.), 
    following the engagement mechanics and style goals provided.
 3. Ensure every version is optimized for Twitter: scannable at a glance, emotionally resonant, 
    and designed to earn replies, likes, or shares.
@@ -961,13 +966,16 @@ Improvement goals:
 
 Output requirements:
 - Generate {n} improved variants.
-- Each must be distinct, short, sharp, and easy to scan in a Twitter feed.
+- Each must be distinct, sharp, and easy to scan in a Twitter feed.
 - Preserve factual meaning, links, mentions, and hashtags exactly as given.
+- If the original is a statement, all variants must remain statements.
+- If the original is a question, all variants must remain questions.
 - Do NOT add generic filler questions like “like if agree?” or “What do you think?”.
 - At least one variant should create curiosity, at least one should highlight a benefit, 
   and at least one should feel contrarian or bold.
 - Avoid sounding robotic or forced; every variant should feel like it was written by a human 
   who deeply understands social media dynamics.  
+- write it like a human wrote it, but better.
 
 IMPORTANT/ESSENTIAL/MUST FOLLOW:Variants must preserve the core meaning of the original tweet.
 Now generate {n} improved versions that meet the above goals. Keep each version short, punchy, and Twitter-appropriate.
@@ -1546,13 +1554,13 @@ def _has_generic_cta(text: str) -> bool:
 # --- ADD: per-type constraints + getter ------------------------------------
 
 STYLE = {
-    "news":     {"max_emojis": 1, "max_new_hashtags": 1, "cta_required": False, "question_allowed": False,
+    "news":     {"max_emojis": 1, "max_new_hashtags": 0, "cta_required": False, "question_allowed": False,
                  "notes": ["clarity", "authority", "stat_up_front"]},
-    "personal": {"max_emojis": 2, "max_new_hashtags": 1, "cta_required": True,  "question_allowed": True,
+    "personal": {"max_emojis": 2, "max_new_hashtags": 0, "cta_required": True,  "question_allowed": True,
                  "notes": ["vivid_opener", "invite_response"]},
-    "promo":    {"max_emojis": 1, "max_new_hashtags": 1, "cta_required": True,  "question_allowed": False,
+    "promo":    {"max_emojis": 1, "max_new_hashtags": 0, "cta_required": True,  "question_allowed": False,
                  "notes": ["benefit_first", "proof_number", "single_cta"]},
-    "general":  {"max_emojis": 1, "max_new_hashtags": 1, "cta_required": False, "question_allowed": True,
+    "general":  {"max_emojis": 1, "max_new_hashtags": 0, "cta_required": False, "question_allowed": True,
                  "notes": ["hook+novel_angle"]}
 }
 def get_style_constraints(kind: str):
