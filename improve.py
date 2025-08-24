@@ -25,7 +25,7 @@ import random
 import logging
 import dataclasses
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuplex
+from typing import List, Dict, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from types import SimpleNamespace
 from functools import lru_cache
