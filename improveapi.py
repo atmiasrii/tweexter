@@ -111,7 +111,7 @@ async def improve(req: ImproveRequest):
         result = improve_tweet(
             tweet_text=req.text,
             followers=req.followers,
-            num_variants=7,
+            num_variants=20,
             return_all=False,
         )
     except Exception as e:
