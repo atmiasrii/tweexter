@@ -232,7 +232,7 @@ class Settings:
     ALLOW_CTA: bool = True
     TRENDING_HASHTAGS_ENABLED: bool = True
     GEMINI_MODEL: str = "models/gemini-2.5-flash"  # Gemini 2.5 Flash
-    TEMPERATURE: float = 0.3
+    TEMPERATURE: float = 0.55
     TIMEOUT: int = 20                          # seconds
     RETRIES: int = 2
     DISABLE_ENGAGEMENT_MECHANICS: bool = True
